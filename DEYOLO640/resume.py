@@ -9,7 +9,7 @@ if __name__ == '__main__':
     # ========== 修改这里 ==========
     # 指向你中断的那个实验的 last.pt
     # 如果目录名不一样，改成实际的
-    weights_path = "my_project/exp_v8x_1280_final/weights/last.pt"
+    weights_path = "my_project/exp_3mod_s1/weights/last.pt"
     # ==============================
 
     print(f"正在从 checkpoint 恢复: {weights_path}")

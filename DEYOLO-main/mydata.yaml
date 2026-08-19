@@ -1,4 +1,4 @@
-path: /root/autodl-tmp/mydata
+path: D:/learn_pytorch/DEYOLO-main/mydata
 
 train: images/vis_train
 train2: images/Ir_train
