@@ -1,17 +1,20 @@
 """
-train_improved_640.py —— DEYOLO-P2 + AFITDYOLO改进版 (MFFM/CAFM/MFEConv)
-640分辨率, 30轮, batch=4 (48G显存+bmm适配), 与 baseline 严格对照
+train_improved_640_v1.4.py —— DEYOLO-P2 + MFFM跨层融合 v1.4
+640分辨率, 30轮
+
+【v1.4】只保留MFFM跨层融合，C2f_MFE改回C2f，速度接近基线
 """
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
 torch.use_deterministic_algorithms(False)
+torch.backends.cudnn.benchmark = True
 
 from ultralytics import YOLO
 
 if __name__ == '__main__':
-    model = YOLO("ultralytics/models/v8/DEYOLO-p2-AFITD.yaml")
+    model = YOLO("ultralytics/models/v8/DEYOLO-p2-AFITD-v1.4.yaml")
 
     print("冷启动：加载 yolov8s.pt ...")
     ckpt = torch.load("yolov8s.pt", map_location='cuda', weights_only=False)
@@ -37,28 +40,28 @@ if __name__ == '__main__':
 
     model.train(
         data="mydata.yaml",
-        epochs=30,
+        epochs=180,
         imgsz=640,
-        batch=16,             # 48G + 原版bmm 适配
+        batch=16,
         device="cuda",
         cache=True,
         augment=True,
         workers=8,
         amp=True,
-        patience=10,
+        patience=30,
         project="my_project",
-        name="exp_improved_640_afitd",
-        save_period=10,
+        name="exp_improved_640_v1.5_final",  # 改名
+        save_period=20,
         plots=True,
         rect=False,
         box=7.5,
-        cls=0.5,
+        cls=0.7,
         dfl=1.5,
         weight_decay=0.0005,
         label_smoothing=0.0,
         mixup=0.0,
         mosaic=1.0,
-        close_mosaic=5,
+        close_mosaic=10,
         scale=0.5,
         degrees=0.0,
         translate=0.1,
@@ -68,13 +71,13 @@ if __name__ == '__main__':
         hsv_h=0.015,
         hsv_s=0.7,
         hsv_v=0.4,
-        cos_lr=False,
-        lr0=0.01,
+        cos_lr=True,  # 改这里
+        lr0=0.008,
         lrf=0.01,
-        warmup_epochs=3,
+        warmup_epochs=10,
         warmup_momentum=0.8,
         warmup_bias_lr=0.1,
     )
 
     print("\n训练完成！")
-    print("最佳权重: my_project/exp_improved_640_afitd/weights/best.pt")
+    print("最佳权重: my_project/exp_improved_640_v1.4/weights/best.pt")

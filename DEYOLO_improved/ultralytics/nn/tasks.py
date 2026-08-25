@@ -12,8 +12,7 @@ import torch.nn as nn
 from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
                                     Concat, Conv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d, Focus,
                                     GhostBottleneck, GhostConv, HGBlock, HGStem, RepC3, RepConv, DEA, C2f_BiFocus,
-                                    # AFITDYOLO modules
-                                    MFFM, CAFM, MFEConv, C2f_MFE, TriModalDEA)
+                                    MFFM, CAFM)
 from ultralytics.yolo.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.yolo.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.yolo.utils.loss import v8DetectionLoss
@@ -77,7 +76,7 @@ class BaseModel(nn.Module):
             visualize (bool): Save the feature maps of the model if True, defaults to False.
 
         Returns:
-            (torch.Tensor): The last output of the network.
+            (torch.Tensor): The last output of the model.
         """
 
         y, dt = [], []  # outputs
@@ -281,7 +280,7 @@ class DetectionModel(BaseModel):
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
-        return torch.cat(y, -1), None  # augmented inference, train output
+        return torch.cat(y, -1), None  # augmented inference, train
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
@@ -499,17 +498,6 @@ def parse_model(d, ch, ch2, verbose=True):  # model_dict, input_channels(3)
                     c2 = make_divisible(min(c2, max_channels) * width, 8)
                 args = [c1, c2, *args[1:]]
 
-            # ===== AFITDYOLO modules for backbone1 =====
-            elif m is C2f_MFE:
-                c1, c2 = ch[f], args[0]
-                if c2 != nc:
-                    c2 = make_divisible(min(c2, max_channels) * width, 8)
-                # C2f_MFE internally handles divisibility; output remains c2
-                args = [c1, c2, *args[1:]]
-                if n > 1:
-                    args.insert(2, n)
-                    n = 1
-
             else:
                 c2 = ch[f]
 
@@ -551,40 +539,12 @@ def parse_model(d, ch, ch2, verbose=True):  # model_dict, input_channels(3)
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
                 args = [c12, *args[1:]]
 
-            # ===== AFITDYOLO modules for backbone2/head =====
-            elif m is C2f_MFE:
-                c12, c22 = ch2[f], args[0]
-                if c22 != nc:
-                    c22 = make_divisible(min(c22, max_channels) * width, 8)
-                # C2f_MFE internally handles divisibility; output remains c2
-                args = [c12, c22, *args[1:]]
-                if n > 1:
-                    args.insert(2, n)
-                    n = 1
-
-            elif m is MFFM:
-                # MFFM takes 2 inputs: [shallow_idx, deep_idx]
-                # args[0] = output channels
+            elif m in (MFFM, CAFM):
+                c1_shallow, c1_deep = ch2[f[0]], ch2[f[1]]
                 c22 = args[0]
                 if c22 != nc:
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
-                c1_shallow = ch2[f[0]] if f[0] != -1 else ch2[-1]
-                c1_deep = ch2[f[1]] if f[1] != -1 else ch2[-1]
                 args = [c1_shallow, c1_deep, c22, *args[1:]]
-
-            elif m is CAFM:
-                # CAFM takes 1 input (or 2), args[0] = channels
-                c22 = args[0]
-                if c22 != nc:
-                    c22 = make_divisible(min(c22, max_channels) * width, 8)
-                args = [c22, *args[1:]]
-
-            elif m is TriModalDEA:
-                # TriModalDEA takes 3 inputs
-                c22 = args[0]
-                if c22 != nc:
-                    c22 = make_divisible(min(c22, max_channels) * width, 8)
-                args = [c22, *args[1:]]
 
             else:
                 c22 = ch2[f]
@@ -614,7 +574,7 @@ def yaml_model_load(path):
     path = Path(path)
     if path.stem in (f'yolov{d}{x}6' for x in 'nsmlx' for d in (5, 8)):
         new_stem = re.sub(r'(\d+)([nslmx])6(.+)?$', r'\1\2-p6\3', path.stem)
-        LOGGER.warning(f"WARNING ⚠️ Ultralytics YOLO P6 models now use -p6 suffix. Renaming {path.stem} to {new_stem}.")
+        LOGGER.warning(f'WARNING ⚠️ Ultralytics YOLO P6 models now use -p6 suffix. Renaming {path.stem} to {new_stem}.')
         path = path.with_name(new_stem + path.suffix)
 
     unified_path = re.sub(r'(\d+)([nslmx])(.+)?$', r'\1\3', str(path))  # i.e. yolov8x.yaml -> yolov8.yaml

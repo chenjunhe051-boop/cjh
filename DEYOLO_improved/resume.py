@@ -1,22 +1,16 @@
-"""
-resume_train.py —— 从 exp_improved_640_afitd2 断点续训
-"""
-import os
-
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch
 from ultralytics import YOLO
 
 if __name__ == '__main__':
     # 加载 last.pt 断点权重
-    model = YOLO("/root/autodl-tmp/my_project/exp_improved_640_afitd2/weights/last.pt")
+    model = YOLO("/root/autodl-tmp/my_project/exp_improved_640_v1.5_final/weights/last.pt")
 
     # resume=True 会自动恢复优化器状态、学习率调度、当前 epoch 等
     model.train(
-        resume=True,  # ← 关键：断点续训
+        resume=True,
         data="mydata.yaml",
-        epochs=30,  # 总目标轮数（如果已经跑了 N 轮，会继续跑到 30）
+        epochs=180,
         imgsz=640,
         batch=16,
         device="cuda",
@@ -24,20 +18,20 @@ if __name__ == '__main__':
         augment=True,
         workers=8,
         amp=True,
-        patience=10,
+        patience=30,
         project="my_project",
-        name="exp_improved_640_afitd2",  # 必须和原实验名一致，才能写到同一目录
-        save_period=10,
+        name="exp_improved_640_v1.5_final",  # 改名
+        save_period=20,
         plots=True,
         rect=False,
         box=7.5,
-        cls=0.5,
+        cls=0.7,
         dfl=1.5,
         weight_decay=0.0005,
         label_smoothing=0.0,
         mixup=0.0,
         mosaic=1.0,
-        close_mosaic=5,
+        close_mosaic=10,
         scale=0.5,
         degrees=0.0,
         translate=0.1,
@@ -47,13 +41,13 @@ if __name__ == '__main__':
         hsv_h=0.015,
         hsv_s=0.7,
         hsv_v=0.4,
-        cos_lr=False,
-        lr0=0.01,
+        cos_lr=True,  # 改这里
+        lr0=0.008,
         lrf=0.01,
-        warmup_epochs=3,
+        warmup_epochs=10,
         warmup_momentum=0.8,
         warmup_bias_lr=0.1,
     )
 
     print("\n续训完成！")
-    print("最佳权重: /root/autodl-tmp/my_project/exp_improved_640_afitd2/weights/best.pt")
+    print("最佳权重: /root/autodl-tmp/my_project/exp_improved_640_v1.5_final/weights/best.pt")
