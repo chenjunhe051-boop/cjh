@@ -4,7 +4,7 @@ from ultralytics import YOLO
 
 if __name__ == '__main__':
     # 加载 last.pt 断点权重
-    model = YOLO("/root/autodl-tmp/my_project/exp_improved_640_v1.5_final/weights/last.pt")
+    model = YOLO("/root/autodl-tmp/my_project/exp_improved_640_v1.6_final/weights/last.pt")
 
     # resume=True 会自动恢复优化器状态、学习率调度、当前 epoch 等
     model.train(
@@ -20,7 +20,7 @@ if __name__ == '__main__':
         amp=True,
         patience=30,
         project="my_project",
-        name="exp_improved_640_v1.5_final",  # 改名
+        name="exp_improved_640_v1.6_final",  # 改名
         save_period=20,
         plots=True,
         rect=False,
@@ -47,7 +47,8 @@ if __name__ == '__main__':
         warmup_epochs=10,
         warmup_momentum=0.8,
         warmup_bias_lr=0.1,
+        deterministic=False,  # ← 加这一行！
     )
 
     print("\n续训完成！")
-    print("最佳权重: /root/autodl-tmp/my_project/exp_improved_640_v1.5_final/weights/best.pt")
+    print("最佳权重: /root/autodl-tmp/my_project/exp_improved_640_v1.6_final/weights/best.pt")

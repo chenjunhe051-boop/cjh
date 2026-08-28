@@ -1,0 +1,94 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# DEYOLO Improved v2.0
+# Improvements based on: 融合多尺度特征的航拍目标检测算法 (JSS, 2025)
+#   1. D2f replaces C2f at layers 4/6/8 (both backbones) — deformable convolution
+#   2. Added P2/4 detection layer (160×160) for tiny objects
+#   3. FGM + IFM multi-scale information fusion injected into P2/P3
+#   4. 4-layer Detect head: P2/P3/P4/P5
+#
+# Usage: yolo detect train model=DEYOLO_improved.yaml data=your_data.yaml imgsz=640
+
+# Parameters
+nc: 80  # number of classes
+ch: 3   # RGB channels
+ch2: 6  # IR/other modality channels (keep original DEYOLO setting)
+scales:
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]
+  s: [0.33, 0.50, 1024]
+  m: [0.67, 0.75, 768]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.25, 512]
+
+# YOLOv8 backbone1 (RGB)
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]           # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]          # 1-P2/4
+  - [-1, 3, C2f_BiFocus, [128, True]]   # 2-P2/4  ★ saved for P2 head
+  - [-1, 1, Conv, [256, 3, 2]]          # 3-P3/8
+  - [-1, 6, D2f, [256, True]]           # 4-P3/8  ★ D2f (deformable)
+  - [-1, 1, Conv, [512, 3, 2]]          # 5-P4/16
+  - [-1, 6, D2f, [512, True]]           # 6-P4/16 ★ D2f
+  - [-1, 1, Conv, [1024, 3, 2]]         # 7-P5/32
+  - [-1, 3, D2f, [1024, True]]          # 8-P5/32 ★ D2f
+  - [-1, 1, SPPF, [1024, 5]]            # 9
+
+# YOLOv8 backbone2 (IR / other modality)
+backbone2:
+  - [-1, 1, Conv, [64, 3, 2]]           # 10-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]          # 11-P2/4
+  - [-1, 3, C2f_BiFocus, [128, True]]   # 12-P2/4
+  - [-1, 1, Conv, [256, 3, 2]]          # 13-P3/8
+  - [-1, 6, D2f, [256, True]]           # 14-P3/8 ★ D2f
+  - [-1, 1, Conv, [512, 3, 2]]          # 15-P4/16
+  - [-1, 6, D2f, [512, True]]           # 16-P4/16 ★ D2f
+  - [-1, 1, Conv, [1024, 3, 2]]         # 17-P5/32
+  - [-1, 3, D2f, [1024, True]]          # 18-P5/32 ★ D2f
+  - [-1, 1, SPPF, [1024, 5]]            # 19
+
+# Head: DEA fusion + FGM + IFM + 4-layer detection
+head:
+  # --- DEA cross-modal attention (P2/P3/P4/P5) ---
+  - [[2, 12], 1, DEA, [128, 160]]       # 20  P2/4  160×160
+  - [[4, 14], 1, DEA, [256, 80]]        # 21  P3/8   80×80
+  - [[6, 16], 1, DEA, [512, 40]]        # 22  P4/16  40×40
+  - [[9, 19], 1, DEA, [1024, 20]]       # 23  P5/32  20×20
+
+  # --- FGM: gather multi-scale fused features ---
+  - [[20, 21, 22, 23], 1, FGM, [256]]   # 24  global feature 40×40
+
+  # --- Top-down FPN ---
+  - [23, 1, nn.Upsample, [None, 2, 'nearest']]   # 25  20→40
+  - [[-1, 22], 1, Concat, [1]]            # 26  cat P4
+  - [-1, 3, C2f, [512]]                   # 27  P4/16
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]   # 28  40→80
+  - [[-1, 21], 1, Concat, [1]]            # 29  cat P3
+  - [-1, 3, C2f, [256]]                   # 30  P3/8
+
+  # --- IFM inject global into P3 ---
+  - [[30, 24], 1, IFM, [256]]             # 31  enhanced P3
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]   # 32  80→160
+  - [[-1, 20], 1, Concat, [1]]            # 33  cat P2
+  - [-1, 3, C2f, [128]]                   # 34  P2/4
+
+  # --- IFM inject global into P2 ---
+  - [[34, 24], 1, IFM, [128]]             # 35  enhanced P2
+
+  # --- Bottom-up PANet ---
+  - [-1, 1, Conv, [128, 3, 2]]            # 36  160→80
+  - [[-1, 31], 1, Concat, [1]]            # 37  cat enhanced P3
+  - [-1, 3, C2f, [256]]                   # 38  P3/8-small
+
+  - [-1, 1, Conv, [256, 3, 2]]            # 39  80→40
+  - [[-1, 27], 1, Concat, [1]]            # 40  cat P4
+  - [-1, 3, C2f, [512]]                   # 41  P4/16-medium
+
+  - [-1, 1, Conv, [512, 3, 2]]            # 42  40→20
+  - [[-1, 23], 1, Concat, [1]]            # 43  cat P5
+  - [-1, 3, C2f, [1024]]                  # 44  P5/32-large
+
+  # --- Detect: 4 layers (P2/P3/P4/P5) ---
+  - [[35, 38, 41, 44], 1, Detect, [nc]]   # 45  Detect(P2, P3, P4, P5)

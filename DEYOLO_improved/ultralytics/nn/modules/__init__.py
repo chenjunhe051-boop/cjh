@@ -9,7 +9,7 @@ from .transformer import (AIFI, MLP, DeformableTransformerDecoder, DeformableTra
 from .DEA import DEA, DEPA, DECA
 from .BiFocus import C2f_BiFocus, BiFocus
 from .afitd_modules import MFFM, CAFM
-
+from .deformable import DCNv3, D_Bottleneck, D2f, GSConv, RepBlock, FGM, IFM
 
 __all__ = ('Conv', 'Conv2', 'LightConv', 'RepConv', 'DWConv', 'DWConvTranspose2d', 'ConvTranspose', 'Focus', 'GhostConv',
            'Concat', 'TransformerLayer', 'TransformerBlock', 'MLPBlock', 'LayerNorm2d', 'DFL', 'HGBlock', 'HGStem',
@@ -17,4 +17,5 @@ __all__ = ('Conv', 'Conv2', 'LightConv', 'RepConv', 'DWConv', 'DWConvTranspose2d
            'BottleneckCSP', 'Proto', 'Detect', 'TransformerEncoderLayer', 'RepC3', 'AIFI',
            'DeformableTransformerDecoder', 'DeformableTransformerDecoderLayer', 'MSDeformAttn', 'MLP',
            'C2f_BiFocus', 'DEA',
-           'MFFM', 'CAFM')
+           'MFFM', 'CAFM',
+           'DCNv3', 'D_Bottleneck', 'D2f', 'GSConv', 'RepBlock', 'FGM', 'IFM')

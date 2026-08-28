@@ -14,7 +14,7 @@ torch.backends.cudnn.benchmark = True
 from ultralytics import YOLO
 
 if __name__ == '__main__':
-    model = YOLO("ultralytics/models/v8/DEYOLO-p2-AFITD-v1.4.yaml")
+    model = YOLO("ultralytics/models/v8/DEYOLO_improved.yaml")  # ← 改这里
 
     print("冷启动：加载 yolov8s.pt ...")
     ckpt = torch.load("yolov8s.pt", map_location='cuda', weights_only=False)
@@ -50,7 +50,7 @@ if __name__ == '__main__':
         amp=True,
         patience=30,
         project="my_project",
-        name="exp_improved_640_v1.5_final",  # 改名
+        name="exp_improved_640_v1.6_final",  # 改名
         save_period=20,
         plots=True,
         rect=False,
@@ -77,7 +77,8 @@ if __name__ == '__main__':
         warmup_epochs=10,
         warmup_momentum=0.8,
         warmup_bias_lr=0.1,
+        deterministic=False,  # ← 加这一行！
     )
 
     print("\n训练完成！")
-    print("最佳权重: my_project/exp_improved_640_v1.4/weights/best.pt")
+    print("最佳权重: my_project/exp_improved_640_v1.6/weights/best.pt")

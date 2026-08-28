@@ -8,11 +8,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-
 from ultralytics.nn.modules import (AIFI, C1, C2, C3, C3TR, SPP, SPPF, Bottleneck, BottleneckCSP, C2f, C3Ghost, C3x,
                                     Concat, Conv, Conv2, ConvTranspose, Detect, DWConv, DWConvTranspose2d, Focus,
                                     GhostBottleneck, GhostConv, HGBlock, HGStem, RepC3, RepConv, DEA, C2f_BiFocus,
-                                    MFFM, CAFM)
+                                    MFFM, CAFM, D2f, D_Bottleneck, FGM, IFM, GSConv, RepBlock, DCNv3)  # ★ NEW imports
 from ultralytics.yolo.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.yolo.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.yolo.utils.loss import v8DetectionLoss
@@ -61,8 +60,6 @@ class BaseModel(nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
-        # if augment:
-        #     return self._predict_augment(x)
         return self._predict_once(x1, x2, profile, visualize)
 
     def _predict_once(self, x1, x2, profile=False, visualize=False):
@@ -276,11 +273,10 @@ class DetectionModel(BaseModel):
         for si, fi in zip(s, f):
             xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
             yi = super().predict(xi)[0]  # forward
-            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
             yi = self._descale_pred(yi, fi, si, img_size)
             y.append(yi)
         y = self._clip_augmented(y)  # clip augmented tails
-        return torch.cat(y, -1), None  # augmented inference, train
+        return torch.cat(y, -1), None  # augmented inference, train output
 
     @staticmethod
     def _descale_pred(p, flips, scale, img_size, dim=1):
@@ -318,8 +314,6 @@ class Ensemble(nn.ModuleList):
     def forward(self, x, augment=False, profile=False, visualize=False):
         """Function generates the YOLOv5 network's final layer."""
         y = [module(x, augment, profile, visualize)[0] for module in self]
-        # y = torch.stack(y).max(0)[0]  # max ensemble
-        # y = torch.stack(y).mean(0)  # mean ensemble
         y = torch.cat(y, 2)  # nms ensemble, y shape(B, HW, C)
         return y, None  # inference, train output
 
@@ -348,9 +342,9 @@ def torch_safe_load(weight):
     except ModuleNotFoundError as e:  # e.name is missing module name
         if e.name == 'models':
             raise TypeError(
-                emojis(f'ERROR ❌️ {weight} appears to be an Ultralytics YOLOv5 model originally trained '
-                       f'with https://github.com/ultralytics/yolov5.\nThis model is NOT forwards compatible with '
-                       f'YOLOv8 at https://github.com/ultralytics/ultralytics.'
+                emojis(f"ERROR ❌️ {weight} appears to be an Ultralytics YOLOv5 model originally trained "
+                       f"with https://github.com/ultralytics/yolov5.\nThis model is NOT forwards compatible with "
+                       f"YOLOv8 at https://github.com/ultralytics/ultralytics."
                        f"\nRecommend fixes are to train a new model using the latest 'ultralytics' package or to "
                        f"run a command with an official YOLOv8 model, i.e. 'yolo predict model=yolov8n.pt'")) from e
         LOGGER.warning(f"WARNING ⚠️ {weight} appears to require '{e.name}', which is not in ultralytics requirements."
@@ -469,12 +463,13 @@ def parse_model(d, ch, ch2, verbose=True):  # model_dict, input_channels(3)
         #  backbone1  -->  for RGB  #
         if i < layers_single:
             if m in (Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                     BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3):
+                     BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3,
+                     D2f):  # ★ Added D2f
                 c1, c2 = ch[f], args[0]
                 if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                     c2 = make_divisible(min(c2, max_channels) * width, 8)
                 args = [c1, c2, *args[1:]]
-                if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3):
+                if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3, D2f):  # ★ Added D2f
                     args.insert(2, n)  # number of repeats
                     n = 1
             elif m is AIFI:
@@ -491,25 +486,24 @@ def parse_model(d, ch, ch2, verbose=True):  # model_dict, input_channels(3)
                 c2 = sum(ch[x] for x in f)
             elif m is Detect:
                 args.append([ch[x] for x in f])
-
             elif m is C2f_BiFocus:
                 c1, c2 = ch[f], args[0]
-                if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                if c2 != nc:
                     c2 = make_divisible(min(c2, max_channels) * width, 8)
                 args = [c1, c2, *args[1:]]
-
             else:
                 c2 = ch[f]
 
         #  backbone2  -->  for IR and RGB-IR  #
         else:
             if m in (Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, Focus,
-                     BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3):
+                     BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, RepC3,
+                     D2f):  # ★ Added D2f
                 c12, c22 = ch2[f], args[0]
                 if c22 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
                 args = [c12, c22, *args[1:]]
-                if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3):
+                if m in (BottleneckCSP, C1, C2, C2f, C3, C3TR, C3Ghost, C3x, RepC3, D2f):  # ★ Added D2f
                     args.insert(2, n)  # number of repeats
                     n = 1
             elif m is AIFI:
@@ -526,26 +520,35 @@ def parse_model(d, ch, ch2, verbose=True):  # model_dict, input_channels(3)
                 c22 = sum(ch2[x] for x in f)
             elif m is Detect:
                 args.append([ch2[x] for x in f])
-
             elif m is C2f_BiFocus:
                 c12, c22 = ch2[f], args[0]
-                if c22 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                if c22 != nc:
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
                 args = [c12, c22, *args[1:]]
-
             elif m is DEA:
                 c12, c22 = ch2[f[0]], args[0]
                 if c22 != nc:
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
                 args = [c12, *args[1:]]
-
             elif m in (MFFM, CAFM):
                 c1_shallow, c1_deep = ch2[f[0]], ch2[f[1]]
                 c22 = args[0]
                 if c22 != nc:
                     c22 = make_divisible(min(c22, max_channels) * width, 8)
                 args = [c1_shallow, c1_deep, c22, *args[1:]]
-
+            # ★★★ NEW: FGM and IFM handling ★★★
+            elif m is FGM:
+                c_ins = [ch2[x] for x in f]
+                c22 = args[0]
+                if c22 != nc:
+                    c22 = make_divisible(min(c22, max_channels) * width, 8)
+                args = [*c_ins, c22, *args[1:]]
+            elif m is IFM:
+                c_local, c_global = ch2[f[0]], ch2[f[1]]
+                c22 = args[0]
+                if c22 != nc:
+                    c22 = make_divisible(min(c22, max_channels) * width, 8)
+                args = [c_local, c_global, c22, *args[1:]]
             else:
                 c22 = ch2[f]
 
@@ -573,11 +576,11 @@ def yaml_model_load(path):
 
     path = Path(path)
     if path.stem in (f'yolov{d}{x}6' for x in 'nsmlx' for d in (5, 8)):
-        new_stem = re.sub(r'(\d+)([nslmx])6(.+)?$', r'\1\2-p6\3', path.stem)
+        new_stem = re.sub(r'(\d+)([nslmx])6(.+)?$', r'-p6', path.stem)
         LOGGER.warning(f'WARNING ⚠️ Ultralytics YOLO P6 models now use -p6 suffix. Renaming {path.stem} to {new_stem}.')
         path = path.with_name(new_stem + path.suffix)
 
-    unified_path = re.sub(r'(\d+)([nslmx])(.+)?$', r'\1\3', str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
+    unified_path = re.sub(r'(\d+)([nslmx])(.+)?$', r'', str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = yaml_load(yaml_file)  # model dict
     d['scale'] = guess_model_scale(path)
