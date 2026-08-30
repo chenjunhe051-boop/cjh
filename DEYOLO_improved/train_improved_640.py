@@ -14,7 +14,7 @@ torch.backends.cudnn.benchmark = True
 from ultralytics import YOLO
 
 if __name__ == '__main__':
-    model = YOLO("ultralytics/models/v8/DEYOLO_improved.yaml")  # ← 改这里
+    model = YOLO("ultralytics/models/v8/DEYOLO_improved_MFFM.yaml")  # ← 改这里
 
     print("冷启动：加载 yolov8s.pt ...")
     ckpt = torch.load("yolov8s.pt", map_location='cuda', weights_only=False)
