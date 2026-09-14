@@ -1,0 +1,24 @@
+# mydata_all.yaml — 全量数据配置 (train+val 合并, 2000 张, 用于最终提交版微调)
+# 注意: 合并后验证集参与训练, 本地 val 分数会虚高, 这是正常的——最终以比赛测试集提交分数为准
+# path 必须与 mydata_vis.yaml 完全一致
+
+path: /root/autodl-tmp/cityvimd   # ← 核对你服务器上的实际路径, 与 mydata_vis.yaml 相同
+train:
+  - images/train
+  - images/val
+val: images/val
+
+nc: 12
+names:
+  0: person
+  1: boat
+  2: animal
+  3: seat
+  4: sign
+  5: bicycle
+  6: car
+  7: ball
+  8: light
+  9: garbage_can
+  10: uav
+  11: tricycle
