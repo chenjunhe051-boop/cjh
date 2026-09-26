@@ -3,12 +3,12 @@
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg
 
-task: detect # (str) YOLO task, i.e. detect, segment, semantic, depth, classify, pose, obb
+task: detect # (str) YOLO task, i.e. detect, segment, semantic, classify, pose, obb
 mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmark
 
 # Train settings -------------------------------------------------------------------------------------------------------
 model: # (str, optional) path to model file, i.e. yolo26n.pt or yolo26n.yaml
-data: # (str, optional) path to dataset file or classification directory/name
+data: # (str, optional) path to data file, i.e. coco8.yaml
 epochs: 100 # (int) number of epochs to train for
 time: # (float, optional) max hours to train; overrides epochs if set
 patience: 100 # (int) early stop after N epochs without val improvement
@@ -17,15 +17,15 @@ imgsz: 640 # (int | list) train/val use int (square); predict/export may use [h,
 save: True # (bool) save train checkpoints and predict results
 save_period: -1 # (int) save checkpoint every N epochs; disabled if < 1
 cache: False # (bool | str) cache images in RAM (True/'ram') or on 'disk' to speed dataloading; False disables
-device: # (int | str | list) device: 0/[0,1] CUDA, 'npu:0' Ascend, 'xpu:0' Intel, 'cpu'/'mps', -1/[-1,-1] auto GPUs
+device: # (int | str | list) device: 0 or [0,1,2,3] for CUDA, 'cpu'/'mps', or -1/[-1,-1] to auto-select idle GPUs
 workers: 8 # (int) dataloader workers (per RANK if DDP)
 project: # (str, optional) project name for results root
-name: # (str, optional) experiment name or export hardware target
+name: # (str, optional) experiment name; results in 'project/name'
 exist_ok: False # (bool) overwrite existing 'project/name' if True
 pretrained: True # (bool | str) use pretrained weights (bool) or load weights from path (str)
 cls_remap: True # (bool) when fine-tuning across datasets, remap pretrained cls head rows by class-name match
 optimizer: auto # (str) optimizer: SGD, MuSGD, Adam, Adamax, AdamW, NAdam, RAdam, RMSProp, or auto
-verbose: True # (bool) print verbose logs
+verbose: True # (bool) print verbose logs during training/val
 seed: 0 # (int) random seed for reproducibility
 deterministic: True # (bool) enable deterministic ops; reproducible but may be slower
 single_cls: False # (bool) treat all classes as a single class
@@ -33,13 +33,12 @@ rect: False # (bool) rectangular batches for train; rectangular batching for val
 cos_lr: False # (bool) cosine learning rate scheduler
 close_mosaic: 10 # (int) disable mosaic augmentation for final N epochs (0 to keep enabled)
 resume: False # (bool) resume training from last checkpoint in the run dir
-amp: True # (bool | str) train precision: True/'fp16' (AMP check), 'bf16', or False/'fp32'; AMP uses FP16 train validation
-fraction: 1.0 # (float | int | list) train ratio/count or split values; 1 = all, integer >1 = count, test 0 = none
+amp: True # (bool) Automatic Mixed Precision (AMP) training; True runs AMP capability check
+fraction: 1.0 # (float) fraction of training dataset to use (>0.0, 1.0 = all)
 profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
-freeze: # (int | list, optional) freeze first N layers (int), or specific layer indices or module names like "23.cv2" (list)
+freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
-channels_last: # (bool, optional) auto-enable for CUDA training on PyTorch 1.11+ and supported x86 CPU inference
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)
@@ -51,20 +50,20 @@ dropout: 0.0 # (float) dropout for classification head (classify only)
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
-save_json: False # (bool) save COCO JSON (detect/segment/pose), compute detect size metrics, or save semantic PNG masks
+save_json: False # (bool) save results to COCO JSON (detect/segment/pose) or PNG masks (semantic) for external evaluation
 conf: # (float, optional) confidence threshold; defaults: predict=0.25, val=0.001
 iou: 0.7 # (float) IoU threshold used for NMS
 max_det: 300 # (int) maximum number of detections per image
-quantize: # (int|str, optional) precision: predict/val 16/fp16 or 32/fp32/None sets pt/torchscript compute; elsewhere the artifact/runtime decides, though 16 rounds openvino/triton inputs and returns triton outputs as fp16; export also supports 8/int8 and w8a8|w16a16|w8a16|w8a32; train uses 8/int8 for quantization-aware training (QAT); replaces deprecated half/int8 args
+quantize: # (int|str, optional) precision: predict/val use 16/fp16 for FP16 or 32/fp32/None for FP32; export also supports 8/int8 and w8a8|w16a16|w8a16|w8a32; replaces deprecated half/int8 args
 dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
-nms: # (bool, optional) None: external NMS (default); True: embed NMS on export; False: NMS-free head if available
+end2end: # (bool, optional) whether to use end2end head (YOLO26, YOLOv10) for predict/val/export
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) path/dir/URL/stream for images or videos; e.g. 'ultralytics/assets' or '0' for webcam
 vid_stride: 1 # (int) read every Nth frame for video sources
 stream_buffer: False # (bool) True buffers all frames; False keeps the most recent frame for low-latency streams
-visualize: False # (bool) save class activation heatmaps (predict) or visualize TP/FP/FN confusion (val)
+visualize: False # (bool) visualize model features (predict) or TP/FP/FN confusion (val)
 augment: False # (bool) apply test-time augmentation during prediction
 agnostic_nms: False # (bool) class-agnostic NMS
 classes: # (int | list[int], optional) filter by class id(s), e.g. 0 or [0,2,3]
@@ -83,13 +82,19 @@ show_boxes: True # (bool) draw bounding boxes on images
 line_width: # (int, optional) line width of boxes; auto-scales with image size if not set
 
 # Export settings ------------------------------------------------------------------------------------------------------
-format: torchscript # (str) target format, e.g. torchscript|onnx|openvino|engine|coreml|saved_model|pb|edgetpu|paddle|mnn|ncnn|imx|rknn|executorch|axelera|deepx|qnn|litert|hailo|ascend
+format: torchscript # (str) target format, e.g. torchscript|onnx|openvino|engine|coreml|saved_model|pb|edgetpu|paddle|mnn|ncnn|imx|rknn|executorch|axelera|deepx|qnn|litert|hailo
 keras: False # (bool) TF SavedModel only (format=saved_model); enable Keras layers during export
 optimize: False # (bool) DEEPX only; higher compiler optimization (slower compile, faster inference)
 dynamic: False # (bool) dynamic shapes for torchscript, onnx, openvino, engine, coreml; enable variable image sizes
-simplify: True # (bool) supported ONNX-based exports (see export table); simplify intermediate ONNX graph
-opset: # (int, optional) supported ONNX-based exports (see export table); intermediate ONNX opset version
+simplify: True # (bool) ONNX/engine only; run graph simplifier for cleaner ONNX before runtime conversion
+opset: # (int, optional) ONNX/engine only; opset version for export; leave unset to use a tested default
 workspace: # (float, optional) engine (TensorRT) only; workspace size in GiB, e.g. 4
+nms: False # (bool) fuse NMS into exported model when backend supports; if True, conf/iou apply (agnostic_nms except coreml)
+pre_export_prune: False # (bool) run an explicit, auditable MoE expert-pruning pass before export
+moe_prune_threshold: 0.15 # (float) minimum calibrated expert usage share to retain during pre-export pruning
+moe_prune_keep_top_m: # (int, optional) always retain this many top-scoring experts per MoE layer
+moe_prune_calibration_steps: 8 # (int) synthetic export-input calibration forwards for pre-export pruning
+molora_export_mode: dynamic # (str) MoLoRA export policy: dynamic or routing_preserved (ONNX/TorchScript)
 
 # Hyperparameters ------------------------------------------------------------------------------------------------------
 lr0: 0.01 # (float) initial learning rate (SGD=1e-2, Adam/AdamW=1e-3)
@@ -101,17 +106,79 @@ warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 distill_model: # (str, optional) path to teacher model for knowledge distillation
 dis: 6.0 # (float) distillation loss weight
+
+# Small-target adaptive label assignment (training-only; default preserves the existing fixed-stride behavior) -------
+stal_mode: fixed # (str) candidate policy: tal (no expansion), fixed (legacy stride expansion), or adaptive
+stal_small_area: 1024.0 # (float) small-object threshold in assigner-input pixels (32^2)
+stal_medium_area: 9216.0 # (float) medium-object threshold in assigner-input pixels (96^2)
+stal_candidate_scale: 1.5 # (float) adaptive expansion factor applied to small-object width and height
+stal_min_candidates: 3 # (int) minimum pre-conflict candidate anchors guaranteed for each valid small GT
+stal_topk_small: 13 # (int) adaptive top-k for small GT
+stal_topk_medium: 10 # (int) adaptive top-k for medium GT
+stal_topk_large: 10 # (int) adaptive top-k for large GT
+
+# Foundation teacher distillation (training-only, opt-in; does not affect deployment) -------------------------------
+foundation_enabled: False # (bool) enable Foundation Teacher distillation during training
+foundation_teacher: none # (str) teacher family: none, dinov3, siglip2, or multi
+foundation_backend: transformers # (str) teacher backend: transformers or local
+foundation_model: # (str, optional) Foundation model id or local model path
+foundation_weights: # (str, optional) optional local Foundation teacher weights path
+foundation_dinov3_model: # (str, optional) F14 DINOv3 model id; falls back to foundation_model
+foundation_siglip2_model: google/siglip2-base-patch16-512 # (str) F14 SigLIP2 model id
+foundation_dinov3_weights: # (str, optional) F14 DINOv3 weights override
+foundation_siglip2_weights: # (str, optional) F14 SigLIP2 weights override
+foundation_target_levels: [p4] # (list[str]) student feature levels to distill
+foundation_multiscale: False # (bool) enable F10 P3/P4/P5 multi-scale adapters
+foundation_align_dim: 256 # (int) shared channel dimension for student/teacher feature alignment
+foundation_loss: relational # (str) distillation loss: cosine, l2, relational, or hybrid
+foundation_relation_mode: sampled # (str) relational KD mode: sampled or full
+foundation_relation_samples: 256 # (int) maximum spatial tokens for sampled relational KD
+foundation_loss_weight: 0.0 # (float) total Foundation distillation loss weight; 0 disables teacher work
+foundation_weight_schedule: constant # (str) loss-weight schedule: constant or gate_decay (cosine-gated ramp-in + late decay)
+foundation_gate_cosine: 1.0 # (float) gate_decay: cosine-loss EMA threshold where the weight ramp starts opening
+foundation_gate_cosine_low: 0.9 # (float) gate_decay: EMA level below which the gate closes again (prevents over-alignment); 0 disables
+foundation_gate_width: 0.05 # (float) gate_decay: cosine-loss EMA span over which the ramp fully opens
+foundation_warmup_floor: 0.2 # (float) gate_decay: minimum weight fraction while the gate is closed
+foundation_decay_start: 0.7 # (float) gate_decay: training-progress fraction where linear decay to zero begins
+foundation_gate_ema: 0.9 # (float) gate_decay: EMA momentum for the cosine gate signal
+foundation_relation_weight: 1.0 # (float) relational component weight
+foundation_cosine_weight: 1.0 # (float) cosine component weight
+foundation_foreground_weighting: False # (bool) apply GT foreground-aware weighting to Foundation KD
+foundation_foreground_weight: 1.5 # (float) weight for P4 tokens inside GT boxes
+foundation_boundary_weight: 1.0 # (float) weight for one-cell GT box boundary tokens
+foundation_background_weight: 0.25 # (float) weight for P4 background tokens
+foundation_cache_teacher_features: False # (bool) cache teacher features (future phase)
+foundation_cache_dir: # (str, optional) offline teacher feature cache directory (python -m ultralytics.nn.foundation.offline)
+foundation_teacher_dtype: auto # (str) teacher dtype: auto, fp32, fp16, or bf16
+foundation_teacher_device: auto # (str|int) teacher device selector, independent of student device
+foundation_router_distill: False # (bool) enable F11 LatentMixture teacher-to-student routing distillation
+foundation_router_loss_weight: 0.0 # (float) F11 routing distillation loss weight
+foundation_router_temperature: 1.0 # (float) F11 routing KD temperature
+foundation_router_teachers: [dinov3, siglip2] # (list[str]) F14 ordered teacher inputs
+foundation_router_native_state: True # (bool) include the detached YOLO native routing state in teacher context
+foundation_semantic_distill: False # (bool) enable F13 positive-region semantic distillation
+foundation_semantic_loss_weight: 0.0 # (float) semantic distillation loss weight
+foundation_semantic_text_weight: 1.0 # (float) region-to-text prototype loss weight
+foundation_semantic_image_weight: 1.0 # (float) region-to-image embedding loss weight
+foundation_semantic_temperature: 0.07 # (float) region-text contrastive temperature
+foundation_semantic_prompts: # (list[str], optional) explicit class prompts; defaults to model.names
+foundation_semantic_prompt_template: "a photo of a {class_name}" # (str) template for automatic class prompts
+foundation_response_distill: False # (bool) enable detection-level pseudo-label KD from the teacher response channel (boxes + logits)
+foundation_response_loss_weight: 0.0 # (float) response-channel pseudo-label loss weight
+foundation_response_score_threshold: 0.5 # (float) teacher score threshold for pseudo-label selection
+foundation_multitask: False # (bool) F15 explicit MultiTask Foundation representation-transfer diagnostics
+foundation_multitask_enabled: False # (bool, optional alias) backwards-compatible spelling for foundation_multitask
+foundation_multitask_tasks: # (list[str], optional) expected active tasks; empty means infer from the model head
+foundation_multitask_negative_transfer_threshold: 4.0 # (float) task-loss max/min ratio reported as negative-transfer risk
+moe_dynamic_schedule: none # (str) epoch-level MoE balance-loss scheduling: none or gini
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)
-dfl: 1.5 # (float) box distance loss gain (DFL when reg_max > 1, L1 on DFL-free YOLO26)
+dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
 angle: 1.0 # (float) oriented angle loss gain (obb tasks)
-dlog: 1.0 # (float) depth log (SILog) loss gain (depth tasks)
-dgrad: 0.5 # (float) depth gradient loss gain (depth tasks)
-dlam: 1.0 # (float) depth SILog variance focus: 1.0=scale-invariant, 0.0=log-RMSE (depth tasks)
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
@@ -127,13 +194,190 @@ bgr: 0.0 # (float) RGB↔BGR channel swap probability
 mosaic: 1.0 # (float) mosaic augmentation probability
 mixup: 0.0 # (float) MixUp augmentation probability
 cutmix: 0.0 # (float) CutMix augmentation probability
-copy_paste: 0.0 # (float) segment/obb copy-paste fraction of eligible objects
-copy_paste_mode: flip # (str) copy-paste strategy for segment/obb: flip or mixup
+copy_paste: 0.0 # (float) segmentation copy-paste probability
+copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup
 auto_augment: randaugment # (str) classification auto augmentation policy: randaugment, autoaugment, augmix
 erasing: 0.4 # (float) random erasing probability for classification (0.0–1.0)
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults
 
+# A2 final acceptance configuration -------------------------------------------------------------------------------
+# The A2 runner consumes these settings as its fixed final acceptance protocol.
+stal_area_threshold: 16.0 # (float) final A2 AT-STAL bbox-area threshold in transformed pixels^2
+stal_min_candidates: 4 # (int) final A2 minimum one-to-many candidates for eligible GTs
+a2_model: v0.1-N # (str) final A2 model variant
+a2_epochs: 120 # (int) final A2 training epochs
+a2_imgsz: 800 # (int) final A2 training and validation image size
+a2_batch: 8 # (int) final A2 batch size
+a2_seed: 42 # (int) final A2 reproducibility seed
+a2_patience: 0 # (int) final A2 early-stopping patience
+a2_wandb_project: yolo-master-a2-0831 # (str) final A2 W&B project
+
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: tracktrack.yaml # (str) tracker config: botsort.yaml, bytetrack.yaml, ocsort.yaml, deepocsort.yaml, fasttrack.yaml, tracktrack.yaml
+
+# Mixture and PEFT extensions -------------------------------------------------------------------------------------------
+weighted: False # (bool) weighted NMS
+cluster: False # (bool) cluster NMS (MoE optimized)
+sigma: 0.1 # (float) Gaussian sigma for Cluster-Weighted NMS
+iou_type: iou # (str) NMS IoU type (iou, diou, ciou)
+sparse_sahi: False # (bool) use Sparse SAHI inference
+slice_size: 640 # (int) slice size for SAHI
+overlap_ratio: 0.2 # (float) overlap ratio for SAHI slices
+objectness_threshold: 0.15 # (float) threshold for objectness mask activation in Sparse SAHI (0.0-1.0)
+sparse_sahi_fallback: True # (bool) fallback to full SAHI when global detection finds no objects
+moe: 0.3 # (float) moe loss gain (was 0.15, too low to prevent routing collapse)
+lora_r: 0 # (int) LoRA rank (0 to disable). Default is 0 (disabled) for backward compatibility; set to a positive value (e.g. 16) to enable LoRA fine-tuning.
+lora_alpha: 32 # (int) LoRA alpha (recommended: 2 * r)
+lora_dropout: 0.05 # (float) LoRA dropout
+lora_bias: "none" # (str) LoRA bias type: "none", "all", "lora_only"
+lora_backend: "auto" # (str) LoRA backend: "auto", "peft", "fallback"
+lora_variant: "lora" # (str) Adapter variant: "lora", "loha", "dora"
+lora_planner_enabled: False # (bool) Enable architecture-conditioned PEFT Planner for automatic variant/rank selection (opt-in, backward compatible)
+lora_adapter_budget: # (int, optional) Maximum adapter parameters for planner placement
+lora_planner_solver: "ao" # (str) Planner budget solver: ao, dco, mip
+lora_planner_backend: "legacy" # (str) Planner backend: legacy or vpeft (opt-in)
+lora_vpeft_strict: False # (bool) Raise unexpected internal V-PEFT errors instead of compatibility fallback
+lora_include_head: False # (bool) Include YOLO detection head layers in LoRA targeting
+lora_freeze_bn: False # (bool) Freeze BatchNorm layers during LoRA training
+lora_target_modules: # (list[str], optional) LoRA target modules
+lora_rank_pattern: # (dict[str, int], optional) Per-target LoRA ranks produced by placement planning
+lora_save_adapters: True # (bool) Save LoRA adapters
+lora_adapter_dir: "lora_adapter" # (str) Directory name for adapters
+lora_auto_r_ratio: 0.0 # (float) Auto calculate LoRA rank based on params ratio
+lora_use_dora: False # (bool) Enable DoRA (Weight-Decomposed Low-Rank Adaptation)
+lora_allow_rtdetr_dora: False # (bool) Allow experimental RT-DETR + DoRA instead of auto-degrading to plain LoRA
+lora_use_rslora: True # (bool) Enable RS-LoRA scaling for better high-rank stability
+lora_init_lora_weights: True # (bool|str) LoRA init mode: True/False for standard init, or "gaussian". "pissa"/"olora" require newer PEFT.
+lora_type: "lora" # (str) PEFT type: "lora", "loha", "lokr", "adalora", "ia3", "oft", "boft", "hra"
+lora_quantization: "none" # (str) Quantization type: "none", "4bit", "8bit" (Requires bitsandbytes)
+lora_sensitivity_select: false # (bool) Select targets by calibration gradient sensitivity
+lora_sensitivity_num_batches: 4 # (int) Maximum calibration batches for sensitivity scoring
+lora_sensitivity_top_ratio: 0.5 # (float) Fraction of structurally valid targets to retain
+lora_sensitivity_beta: 1.0 # (float) Reserved score smoothing coefficient
+lora_sensitivity_max_layers: null # (int) Optional cap on selected targets
+lora_sensitivity_keep_risky: false # (bool) Keep planner-risky targets when scoring
+lora_include_moe: False # (bool) Include MoE layers in auto-detection
+lora_include_attention: False # (bool) Include Attention layers in auto-detection
+lora_only_backbone: False # (bool) Only apply LoRA to backbone
+lora_only_3x3: False # (bool) Skip 1x1 convs during auto target detection
+lora_exclude_modules: # (list[str], optional) Modules to exclude
+lora_last_n: # (int, optional) Only apply to last N layers
+lora_from_layer: # (int, optional) Start applying from layer index
+lora_to_layer: # (int, optional) Stop applying at layer index
+lora_allow_depthwise: False # (bool) Allow depthwise convolution
+lora_kernels: # (list[int], optional) Filter by kernel size
+lora_skip_stem: True  # Default True: skip un-normalized stem layers (prevents FP16 NaN on first conv)
+lora_min_channels: 0 # (int) Skip layers whose min(in_channels, out_channels) < this value (0 disables; try 32 to keep LoRA genuinely low-rank)
+lora_gradient_checkpointing: True # (bool) Enable gradient checkpointing for LoRA memory optimization
+lora_lr_mult: 2.0 # (float) Learning rate multiplier for LoRA params vs base (2.0 recommended)
+lora_target_r: 8 # (int) AdaLoRA target rank after allocation
+lora_init_r: 12 # (int) AdaLoRA initial rank before pruning
+lora_tinit: 0 # (int) AdaLoRA warmup steps before rank allocation starts
+lora_tfinal: 0 # (int) AdaLoRA final fine-tuning steps after rank allocation ends
+lora_delta_t: 1 # (int) AdaLoRA rank allocation interval in steps
+lora_beta1: 0.85 # (float) AdaLoRA EMA beta1 for sensitivity tracking
+lora_beta2: 0.85 # (float) AdaLoRA EMA beta2 for uncertainty tracking
+lora_orth_reg_weight: 0.5 # (float) AdaLoRA orthogonal regularization weight
+lora_total_step: 0 # (int) AdaLoRA total training steps; 0 lets trainer auto-resolve from iterations
+lora_alpha_warmup: 3 # (int) Epochs to linearly warmup LoRA alpha (0 to disable). PAPER DEFAULT: 3 epochs.
+lora_oft_block_size: 0 # (int) OFT block size (>0 overrides rank r)
+lora_oft_coft: False # (bool) OFT: use constrained Cayley-Neumann rotation
+lora_oft_eps: 6.0e-5 # (float) OFT numerical eps
+lora_oft_block_share: False # (bool) OFT: share rotation across blocks
+lora_boft_block_size: 2 # (int) BOFT butterfly block size (must divide kernel dim; use 1/2 for YOLO 3x3 Conv)
+lora_boft_block_num: 0 # (int) BOFT number of blocks (0 = auto from block_size)
+lora_boft_n_butterfly_factor: 2 # (int) BOFT butterfly factor (paper default)
+lora_hra_apply_gs: False # (bool) HRA: apply Gram-Schmidt orthogonalization
+lora_layer_decay: 0.85 # (float) Layer-wise LR decay rate (0=disabled, 0.85~0.95 typical). PAPER DEFAULT: 0.85 — layer-decay is a core paper contribution and strongest single addition in ablations.
+lora_ortho_weight: 0.0 # (float) Orthogonal regularization weight (0=disabled, 1e-5~1e-3 typical). Enable explicitly after establishing a stable baseline.
+lora_ortho_frequency: 10 # (int) Compute orthogonal loss every N batches (1=every batch, 10=every 10 batches)
+lora_dropout_end: 0.15 # (float) Final dropout for dynamic schedule (must be >= lora_dropout)
+lora_dropout_start_ratio: 0.3 # (float) When to start increasing dropout (fraction of total epochs)
+lora_few_shot_mode: False # (bool) Enable few-shot LoRA with enhanced regularization for small datasets
+lora_few_shot_teacher: # (str, optional) Path to teacher model for knowledge distillation
+lora_few_shot_dropconnect: 0.1 # (float) DropConnect rate for few-shot LoRA (better than dropout for limited data)
+lora_few_shot_distill_weight: 0.5 # (float) Weight for distillation loss when teacher is provided
+lora_few_shot_adaptive_rank: True # (bool) Auto-adjust rank based on data scarcity in few-shot mode
+lora_few_shot_dropconnect_schedule: "cosine" # (str) DropConnect schedule: constant/linear/cosine/exponential
+lora_few_shot_dropconnect_max: 0.3 # (float) Initial max DropConnect rate (for scheduled modes)
+lora_few_shot_dropconnect_min: 0.0 # (float) Final min DropConnect rate (for scheduled modes)
+lora_few_shot_gradient_importance_weighted: False # (bool) Use gradient-importance weighted DropConnect
+lora_few_shot_hierarchical_distill: False # (bool) Enable multi-layer hierarchical distillation
+lora_few_shot_distill_layers: # (list, optional) Layer indices for intermediate distillation e.g. [10, 13, 16]
+lora_few_shot_variational_rank: False # (bool) Enable variational rank selection (Gumbel-Softmax)
+lora_few_shot_rank_budget: 0.5 # (float) Budget ratio for rank retention in variational mode
+lora_few_shot_adaptive_temperature: False # (bool) Enable task-adaptive distillation temperature
+lora_few_shot_curriculum_sampling: False # (bool) Enable curriculum learning sampler
+lora_few_shot_distill_schedule: "cosine" # (str) Distillation weight schedule: constant/linear/cosine
+lora_few_shot_distill_weight_max: 1.0 # (float) Initial max distillation weight
+lora_few_shot_distill_weight_min: 0.1 # (float) Final min distillation weight
+lora_few_shot_use_ema_teacher: False # (bool) Use EMA teacher for progressive self-distillation
+lora_few_shot_ema_decay: 0.999 # (float) EMA teacher decay rate
+lora_few_shot_response_distill: False # (bool) Enable detection head response distillation (cls + bbox)
+lora_few_shot_response_distill_weight: 0.3 # (float) Weight for response distillation loss
+lora_few_shot_layerwise_rank: False # (bool) Enable per-layer adaptive rank based on depth/channels
+lora_few_shot_hook_cache: True # (bool) Cache hierarchical distillation hooks across batches
+moe_num_experts: 4 # (int) Number of experts in MoE layers (0 to use model config)
+moe_top_k: 2 # (int) Number of experts to activate per token
+moe_balance_loss: 1.0 # (float) Load balancing loss coefficient for MoE (1.0 = direct control via moe param)
+moe_noise_std: 0.5 # (float) Noise std for MoE routing (1.0 too noisy after warmup)
+moe_temperature: 1.0 # (float) Temperature for MoE routing logits
+moe_router_z_loss: 0.1 # (float) Router z-loss coefficient (0.1 = prevent uniform collapse while maintaining stability)
+moe_weight_threshold: 0.01 # (float) Weight threshold for conditional computation in MoE
+moe_expert_warmup_epochs: 3 # (int) Epochs to freeze experts while router learns (was 5, too long)
+moe_router_lr_scale: 0.5 # (float) Router LR as fraction of base LR (was 0.1, too small to correct collapse)
+moe_collapse_threshold: 0.8 # (float) If max expert usage > threshold, trigger collapse recovery
+moe_dynamic_gini_target: 0.25 # (float) target expert-usage Gini for dynamic balance scheduling
+moe_dynamic_gini_alpha: 1.0 # (float) exponential response gain for Gini scheduling
+moe_dynamic_gini_beta: 0.8 # (float) epoch-to-epoch EMA momentum for Gini scheduling
+moe_dynamic_balance_min: 0.5 # (float) minimum dynamic MoE balance-loss coefficient
+moe_dynamic_balance_max: 2.0 # (float) maximum dynamic MoE balance-loss coefficient
+mot_balance_loss: 0.01 # (float) GShard balance loss coefficient for MoT blocks
+mot_router_z_loss: 0.01 # (float) Router z-loss coefficient for MoT blocks
+mot_temperature: 1.0 # (float) Initial MoT router temperature
+mot_sparse_train: False # (bool) Sparse expert dispatch during MoT training (faster; default dense for exploration)
+mot_sparse_train_warmup_steps: 0 # (int) Dense MoT training forwards before sparse dispatch when mot_sparse_train=True
+mot_scene_aware_router: False # (bool) Enable the experimental scene-aware residual branch in MoT routers
+mot_scene_hidden_dim: # (int, optional) Hidden size of the MoT scene-statistics projector (null=3)
+mot_scene_consistency: 0.0 # (float) Scene/expert consistency auxiliary-loss coefficient (0 disables)
+mot_scene_inference_mode: dynamic # (str) Scene-aware eval policy: dynamic or bypass
+mot_local_attn_window: 0 # (int) Optional LocalConv expert attention window; 0 keeps global attention
+moa_temperature: 1.0 # (float) Initial MoA router temperature
+moa_aux_loss_coeff: 0.01 # (float) MoA router auxiliary-loss coefficient
+moa_local_window_size: 7 # (int) Window size for MoA local attention head
+moa_regional_max_kv_tokens: 4096 # (int, 0=unlimited) Maximum Regional Head KV tokens
+moa_sparse_inference: False # (bool) Skip low-weight MoA head groups during eval inference
+moa_sparse_inference_threshold: 0.02 # (float) MoA sparse inference skip threshold in [0, 1)
+moa_mot_temperature_factor: 0.97 # (float) Per-epoch router temperature multiplier for MoA/MoT
+moa_mot_min_temperature: 0.3 # (float) Minimum router temperature after annealing
+moe_aux_gain: 1.0 # (float) Gain for MoE balance/z-loss auxiliary loss
+mot_aux_gain: 1.0 # (float) Gain for MoT router auxiliary loss
+moa_aux_gain: 1.0 # (float) Gain for MoA router auxiliary loss
+latent_aux_gain: 0.1 # (float) Gain for Latent Mixture auxiliary loss (conservative default)
+latent_inference_top_k: # (int, optional) Number of latent experts used during eager inference (null=dense)
+mixture_aux_budget: 3.0 # (float) Global normalized budget shared by routed auxiliary losses
+molora_num_experts: 0 # (int) Number of experts in MoLoRA layers (0 to disable)
+molora_top_k: 2 # (int) Number of experts to activate per forward
+molora_router_type: linear # (str) Router type: linear, spatial, hybrid
+molora_router_hidden_dim: # (int, optional) Hidden dimension for the MoLoRA router
+molora_r: 8 # (int) LoRA rank for each expert
+molora_alpha: 16 # (int) LoRA alpha scaling
+molora_balance_loss: 0.01 # (float) Load balancing loss coefficient for MoLoRA
+molora_router_z_loss: 0.001 # (float) Router z-loss coefficient for MoLoRA
+molora_diversity_loss: 0.0 # (float) Diversity loss coefficient for MoLoRA
+molora_expert_init: default # (str) Expert init: default, orthogonal, gaussian
+molora_use_rslora: true # (bool) Use rsLoRA scaling
+molora_share_moe_registry: true # (bool) Share MOE_LOSS_REGISTRY with MoLoRA
+molora_capacity_factor: 0.0 # (float) Capacity multiplier; <=0 or >=num_experts disables the limit
+molora_expert_dropout: 0.0 # (float) Probability of disabling an expert during training
+molora_top_k_warmup: # (int, optional) Steps used to ramp top_k from 1 to the target value
+molora_warmup_steps: 0 # (int) Steps to gradually increase top_k from 1 to target
+molora_domain_experts: # (dict, optional) Domain name to expert-index mapping
+molora_freeze_experts: # (list[int], optional) Expert indices to freeze
+moe_map_saturation_enabled: False # (bool) enable validation-driven MoE balance annealing
+moe_map_saturation_window_size: 5 # (int) validation window for MoE mAP saturation
+moe_map_saturation_threshold: 0.001 # (float) minimum mAP improvement before saturation
+moe_map_saturation_decay_factor: 0.8 # (float) balance-loss decay after saturation
+moe_map_saturation_min_scale: 0.1 # (float) minimum balance-loss scale after repeated saturation

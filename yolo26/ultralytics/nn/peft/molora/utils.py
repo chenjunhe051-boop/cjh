@@ -1,0 +1,269 @@
+"""MoLoRA utilities: parameter stats, merge/unmerge, init, domain allocation."""
+
+import math
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+
+
+# ---------------------------------------------------------------------------
+# rsLoRA scaling
+# ---------------------------------------------------------------------------
+
+
+def _molora_scales(r: int, alpha: int, use_rslora: bool = True) -> float:
+    """Return the LoRA scaling factor.
+
+    Standard: alpha / r
+    rsLoRA:   alpha / sqrt(r)  (Kalajdzievski 2023)
+    """
+    if use_rslora:
+        return alpha / math.sqrt(max(r, 1))
+    return alpha / max(r, 1)
+
+
+# ---------------------------------------------------------------------------
+# Expert initialization
+# ---------------------------------------------------------------------------
+
+
+def init_lora_expert_a(weight: nn.Parameter, init_type: str = "default") -> None:
+    """Initialize LoRA A (down-projection) weight.
+
+    - default:     Kaiming uniform (Hu et al. 2021)
+    - orthogonal:  orthogonal init via QR decomposition
+    - gaussian:    simple N(0, 0.02)
+    """
+    if init_type == "default":
+        nn.init.kaiming_uniform_(weight, a=math.sqrt(5))
+    elif init_type == "orthogonal":
+        # Flatten to 2D, QR, then restore
+        w = weight.data
+        orig_shape = w.shape
+        w_2d = w.view(w.shape[0], -1)
+        q, _ = torch.linalg.qr(w_2d, mode="reduced")
+        # Pad or truncate to match shape
+        if q.shape == w_2d.shape:
+            w.copy_(q.view(orig_shape))
+        else:
+            nn.init.orthogonal_(weight)
+    elif init_type == "gaussian":
+        nn.init.normal_(weight, std=0.02)
+    else:
+        raise ValueError(f"Unknown init_type: {init_type}")
+
+
+def init_lora_expert_b(weight: nn.Parameter, init_type: str = "default") -> None:
+    """Initialize LoRA B (up-projection) weight to zero (default) or small Gaussian."""
+    if init_type == "default":
+        nn.init.zeros_(weight)
+    elif init_type == "gaussian":
+        nn.init.normal_(weight, std=0.02)
+    else:
+        # For orthogonal, B is still zero so training starts from base weights
+        nn.init.zeros_(weight)
+
+
+# ---------------------------------------------------------------------------
+# Module shape introspection
+# ---------------------------------------------------------------------------
+
+
+def get_conv_shape(module: nn.Conv2d) -> Tuple[int, int, int, int, Tuple[int, int], int, int]:
+    """Return (in_channels, out_channels, kernel_size_h, kernel_size_w, padding, stride, groups)."""
+    k = module.kernel_size
+    if isinstance(k, int):
+        k = (k, k)
+    p = module.padding
+    if isinstance(p, int):
+        p = (p, p)
+    return (
+        module.in_channels,
+        module.out_channels,
+        k[0],
+        k[1],
+        p,
+        module.stride[0] if isinstance(module.stride, tuple) else module.stride,
+        module.groups,
+    )
+
+
+def is_conv(module: nn.Module) -> bool:
+    return isinstance(module, nn.Conv2d)
+
+
+def is_linear(module: nn.Module) -> bool:
+    return isinstance(module, nn.Linear)
+
+
+# ---------------------------------------------------------------------------
+# Domain allocation for continual learning
+# ---------------------------------------------------------------------------
+
+
+def allocate_domain_experts(num_experts: int, domains: List[str]) -> Dict[str, List[int]]:
+    """Allocate expert indices evenly across domains.
+
+    Args:
+        num_experts: total number of experts
+        domains: list of domain names
+
+    Returns:
+        dict mapping domain -> list of expert indices
+    """
+    if not domains:
+        return {}
+    n = len(domains)
+    base = num_experts // n
+    remainder = num_experts % n
+    alloc: Dict[str, List[int]] = {}
+    idx = 0
+    for i, domain in enumerate(domains):
+        count = base + (1 if i < remainder else 0)
+        alloc[domain] = list(range(idx, idx + count))
+        idx += count
+    return alloc
+
+
+# ---------------------------------------------------------------------------
+# Parameter freezing / trainability
+# ---------------------------------------------------------------------------
+
+
+def mark_only_molora_as_trainable(model: nn.Module) -> None:
+    """Freeze all parameters except MoLoRA adapter parameters.
+
+    Uses isinstance checking on module types instead of substring matching
+    on parameter names to avoid accidentally unfreezing non-MoLoRA routers
+    (e.g. MoE routing layers that also contain 'router' in their names).
+    """
+    # Lazy import to avoid circular dependency (layer.py / moe_aware.py import utils.py)
+    from ultralytics.nn.peft.molora.layer import MoLoRALayer
+
+    try:
+        from ultralytics.nn.peft.molora.moe_aware import MoLoRAMoEAwareLayer
+
+        molora_types = (MoLoRALayer, MoLoRAMoEAwareLayer)
+    except ImportError:
+        molora_types = (MoLoRALayer,)
+
+    # Freeze everything first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze only MoLoRA adapter parameters (skip base_layer which holds
+    # the original frozen weights).  recurse=True to reach nested experts.
+    for module in model.modules():
+        if isinstance(module, molora_types):
+            for pname, param in module.named_parameters(recurse=True):
+                if "base_layer" not in pname:
+                    param.requires_grad = True
+
+
+def count_parameters(model: nn.Module) -> Dict[str, int]:
+    """Return parameter statistics for a model."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    molora = sum(
+        p.numel() for n, p in model.named_parameters() if any(k in n for k in ("lora_A", "lora_B", "router", "molora"))
+    )
+    return {
+        "total": total,
+        "trainable": trainable,
+        "frozen": total - trainable,
+        "molora": molora,
+        "trainable_pct": 100 * trainable / total if total else 0.0,
+        "molora_pct": 100 * molora / total if total else 0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Merge / Unmerge helpers
+# ---------------------------------------------------------------------------
+
+
+def _conv_expert_delta(lora_a: nn.Conv2d, lora_b: nn.Conv2d, scale: float) -> torch.Tensor:
+    """Full-rank delta [out_c, in_c, kH, kW] equivalent to lora_B(lora_A(x)) * scale.
+
+    lora_A is a dense 1x1 conv [r, in_c, 1, 1]. lora_B is a KxK conv that carries the
+    base layer's groups, so its weight is [out_c, r // groups, kH, kW] and each output
+    group composes only with its own slice of the r rank channels.
+    """
+    a = lora_a.weight.squeeze(-1).squeeze(-1)  # [r, in_c]
+    b = lora_b.weight
+    b_groups = getattr(lora_b, "groups", 1)
+    if b_groups == 1:
+        return torch.einsum("orkw,ri->oikw", b, a) * scale  # [out_c, in_c, kH, kW]
+    out_c, r_per_g = b.shape[0], b.shape[1]
+    bg = b.view(b_groups, out_c // b_groups, r_per_g, *b.shape[2:])
+    ag = a.view(b_groups, r_per_g, a.shape[1])
+    delta = torch.einsum("gorkw,gri->goikw", bg, ag)
+    return delta.reshape(out_c, a.shape[1], *b.shape[2:]) * scale
+
+
+def _fold_delta_for_groups(delta: torch.Tensor, groups: int) -> torch.Tensor:
+    """Fold a full [out_c, in_c, kH, kW] delta to the grouped base shape [out_c, in_c//g, kH, kW]."""
+    if groups <= 1:
+        return delta
+    in_c = delta.shape[1]
+    return delta.view(delta.shape[0], groups, in_c // groups, *delta.shape[2:]).sum(dim=1)
+
+
+def _merge_conv_delta(
+    base_weight: nn.Parameter,
+    lora_a: nn.Conv2d,
+    lora_b: nn.Conv2d,
+    scale: float,
+    groups: int = 1,
+) -> None:
+    """Merge a single LoRA expert delta into a Conv2d base weight.
+
+    Conv2d base weight shape: [out_c, in_c//groups, kH, kW] (grouped)
+    lora_A: [r, in_c, 1, 1]  (1x1 conv, groups=1)
+    lora_B: [out_c, r//groups, kH, kW]  (KxK conv, groups follows the base layer)
+
+    The equivalent full delta is composed per group, then folded to the grouped
+    base shape when groups > 1.
+    """
+    with torch.no_grad():
+        delta = _conv_expert_delta(lora_a, lora_b, scale)
+        base_weight.data.add_(_fold_delta_for_groups(delta, groups))
+
+
+def _merge_linear_delta(
+    base_weight: nn.Parameter,
+    lora_a: nn.Linear,
+    lora_b: nn.Linear,
+    scale: float,
+) -> None:
+    """Merge a single LoRA expert delta into a Linear base weight."""
+    with torch.no_grad():
+        # W' = W + B @ A
+        delta = (lora_b.weight @ lora_a.weight) * scale
+        base_weight.data.add_(delta)
+
+
+def _unmerge_conv_delta(
+    base_weight: nn.Parameter,
+    lora_a: nn.Conv2d,
+    lora_b: nn.Conv2d,
+    scale: float,
+    groups: int = 1,
+) -> None:
+    """Unmerge a single LoRA expert delta from a Conv2d base weight."""
+    with torch.no_grad():
+        delta = _conv_expert_delta(lora_a, lora_b, scale)
+        base_weight.data.sub_(_fold_delta_for_groups(delta, groups))
+
+
+def _unmerge_linear_delta(
+    base_weight: nn.Parameter,
+    lora_a: nn.Linear,
+    lora_b: nn.Linear,
+    scale: float,
+) -> None:
+    """Unmerge a single LoRA expert delta from a Linear base weight."""
+    with torch.no_grad():
+        delta = (lora_b.weight @ lora_a.weight) * scale
+        base_weight.data.sub_(delta)

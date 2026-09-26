@@ -2,24 +2,18 @@
 
 from __future__ import annotations
 
-import platform
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
 
-from ultralytics.utils import LINUX, LOGGER, WINDOWS
 from ultralytics.utils.checks import check_suffix
 from ultralytics.utils.downloads import is_url
-from ultralytics.utils.torch_utils import TORCH_1_10, TORCH_1_13, smart_inference_mode
 
 from .backends import (
-    AscendBackend,
     AxeleraBackend,
-    CoreAIBackend,
     CoreMLBackend,
     DeepXBackend,
     ExecuTorchBackend,
@@ -59,8 +53,6 @@ def check_class_names(names: list | dict) -> dict[int, str]:
         # Convert 1) string keys to int, i.e. '0' to 0, and non-string values to strings, i.e. True to 'True'
         names = {int(k): str(v) for k, v in names.items()}
         n = len(names)
-        if not n:
-            raise KeyError("0-class dataset, at least one class name is required in your dataset YAML.")
         if max(names.keys()) >= n:
             raise KeyError(
                 f"{n}-class dataset requires class indices 0-{n - 1}, but you have invalid class indices "
@@ -125,7 +117,6 @@ class AutoBackend(nn.Module):
             | Qualcomm QNN          | *_qnn.onnx        |
             | LiteRT                | *.tflite          |
             | Hailo                 | *_hailo_model/    |
-            | Huawei Ascend         | *_ascend_model/   |
 
     Attributes:
         backend (BaseBackend): The loaded inference backend instance.
@@ -172,22 +163,18 @@ class AutoBackend(nn.Module):
         "qnn": QNNBackend,
         "litert": LiteRTBackend,
         "hailo": HailoBackend,
-        "ascend": AscendBackend,
-        "coreai": CoreAIBackend,
     }
 
-    @smart_inference_mode(False)
+    @torch.no_grad()
     def __init__(
         self,
         model: str | torch.nn.Module = "yolo26n.pt",
-        device: torch.device | None = None,
+        device: torch.device = torch.device("cpu"),
         dnn: bool = False,
         data: str | Path | None = None,
         fp16: bool = False,
         fuse: bool = True,
         verbose: bool = True,
-        channels_last: bool | None = None,
-        end2end: bool | None = None,
     ):
         """Initialize the AutoBackend for inference.
 
@@ -199,19 +186,10 @@ class AutoBackend(nn.Module):
             fp16 (bool): Enable half-precision inference. Supported only on specific backends.
             fuse (bool): Fuse Conv2D + BatchNorm layers for optimization.
             verbose (bool): Enable verbose logging.
-            channels_last (bool, optional): Use channels-last memory format, or auto-enable it on supported x86 CPUs.
-            end2end (bool, optional): Select the native detection head before fusion; None preserves its current mode.
         """
         super().__init__()
-        device = device or torch.device("cpu")
         # Determine model format from path/URL
         format = "pt" if isinstance(model, nn.Module) else self._model_type(model, dnn)
-        if (
-            isinstance(model, nn.Module)
-            and TORCH_1_10
-            and any(x.is_inference() for x in (*model.parameters(), *model.buffers()))
-        ):
-            model = deepcopy(model)  # retained backends require normal tensors for fusion and later mutation
 
         # Check if format supports FP16
         fp16 &= format in {"pt", "torchscript", "onnx", "openvino", "engine", "triton"}
@@ -239,29 +217,9 @@ class AutoBackend(nn.Module):
         if format == "pt":
             backend_kwargs["fuse"] = fuse
             backend_kwargs["verbose"] = verbose
-            backend_kwargs["end2end"] = end2end
         elif format in {"saved_model", "pb", "edgetpu", "dnn"}:
             backend_kwargs["format"] = format
         self.backend = self._BACKEND_MAP[format](model, **backend_kwargs)
-
-        if format == "pt":
-            device_type = torch.device(self.backend.device).type
-            supported = device_type == "cuda" or (
-                TORCH_1_13
-                and device_type == "cpu"
-                and platform.machine() in {"AMD64", "x86_64"}
-                and torch.backends.mkldnn.is_available()
-                and torch.backends.mkldnn.enabled
-            )
-            if channels_last is None:
-                channels_last = device_type == "cpu" and supported and (LINUX or WINDOWS)
-            if channels_last and not supported:
-                LOGGER.warning(f"'channels_last=True' is not supported on '{device_type}', ignoring.")
-            self.backend.model.to(
-                memory_format=torch.channels_last if channels_last and supported else torch.contiguous_format
-            )
-        elif channels_last:
-            LOGGER.warning(f"'channels_last=True' applies only to native PyTorch models, ignoring format='{format}'.")
 
         self.nhwc = format in {"coreml", "saved_model", "pb", "edgetpu", "rknn"}
         self.format = format
@@ -294,6 +252,7 @@ class AutoBackend(nn.Module):
         self,
         im: torch.Tensor,
         augment: bool = False,
+        visualize: bool = False,
         embed: list | None = None,
         **kwargs: Any,
     ) -> Any:
@@ -302,6 +261,7 @@ class AutoBackend(nn.Module):
         Args:
             im (torch.Tensor): The image tensor to perform inference on.
             augment (bool): Whether to perform data augmentation during inference.
+            visualize (bool): Whether to visualize the output predictions.
             embed (list, optional): A list of layer indices to return embeddings from.
             **kwargs (Any): Additional keyword arguments for model configuration.
 
@@ -316,7 +276,7 @@ class AutoBackend(nn.Module):
         # Build forward kwargs based on backend type
         forward_kwargs = {}
         if self.format == "pt":
-            forward_kwargs = {"augment": augment, "embed": embed, **kwargs}
+            forward_kwargs = {"augment": augment, "visualize": visualize, "embed": embed, **kwargs}
 
         y = self.backend.forward(im, **forward_kwargs)
 
@@ -337,33 +297,40 @@ class AutoBackend(nn.Module):
         Returns:
             (Any): Tensor on `self.device`, or the unchanged non-tensor output.
         """
-        if isinstance(x, np.ndarray):
-            return torch.as_tensor(x, device=self.device)  # shares memory on CPU, one fused copy to accelerators
+        x = torch.tensor(x) if isinstance(x, np.ndarray) else x
         return x.to(self.device) if isinstance(x, torch.Tensor) else x
 
-    def warmup(self, imgsz: tuple[int, int, int, int] = (1, 3, 640, 640), im: torch.Tensor | None = None) -> None:
-        """Warm up the model by running forward pass(es).
+    def warmup(self, imgsz: tuple[int, int, int, int] = (1, 3, 640, 640)) -> None:
+        """Warm up the model by running forward pass(es) with a dummy input.
 
         Args:
             imgsz (tuple[int, int, int, int]): Dummy input shape in (batch, channels, height, width) format.
-            im (torch.Tensor, optional): Input tensor to reuse instead of allocating a dummy.
         """
         from ultralytics.utils.nms import non_max_suppression
 
-        if not self.end2end:
+        model_format = getattr(self, "format", None)
+        if model_format is None:
+            legacy_formats = {
+                "pt": getattr(self, "pt", False),
+                "torchscript": getattr(self, "jit", False),
+                "onnx": getattr(self, "onnx", False),
+                "engine": getattr(self, "engine", False),
+                "saved_model": getattr(self, "saved_model", False),
+                "pb": getattr(self, "pb", False),
+                "triton": getattr(self, "triton", False),
+                "nn_module": getattr(self, "nn_module", False),
+            }
+            model_format = next((name for name, enabled in legacy_formats.items() if enabled), None)
+        if not getattr(self, "end2end", False):
             import torchvision  # noqa (import here triggers torchvision NMS use in nms.py)
-        if self.format in {"pt", "torchscript", "onnx", "engine", "saved_model", "pb", "triton"} and (
-            self.device.type != "cpu" or self.format == "triton"
+        if model_format in {"pt", "torchscript", "onnx", "engine", "saved_model", "pb", "triton", "nn_module"} and (
+            self.device.type != "cpu" or model_format == "triton"
         ):
-            im = (
-                im
-                if im is not None
-                else torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)
-            )
-            for _ in range(2 if self.format == "torchscript" else 1):
+            im = torch.zeros(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)  # input
+            for _ in range(2 if model_format == "torchscript" else 1):
                 self.forward(im)  # warmup model
                 warmup_boxes = torch.rand(1, 84, 16, device=self.device)  # 16 boxes works best empirically
-                warmup_boxes[:, :4] *= im.shape[-1]
+                warmup_boxes[:, :4] *= imgsz[-1]
                 non_max_suppression(warmup_boxes)  # warmup NMS
 
     @staticmethod
@@ -426,7 +393,7 @@ class AutoBackend(nn.Module):
         Returns:
             (AutoBackend): The model instance with the function applied and updated attributes.
         """
-        super()._apply(fn)
+        self = super()._apply(fn)
         if hasattr(self.backend, "model") and isinstance(self.backend.model, nn.Module):
             self.backend.model._apply(fn)
             self.backend.device = next(self.backend.model.parameters()).device  # update device after move

@@ -260,6 +260,9 @@ class TransformerDecoder(nn.Module):
             n_input = 4 if boxRPB == "both" else 2
             self.boxRPB_embed_x = MLP(n_input, d_model, nheads, 2)
             self.boxRPB_embed_y = MLP(n_input, d_model, nheads, 2)
+            self.compilable_cord_cache = None
+            self.compilable_stored_size = None
+            self.coord_cache = {}
 
         if interaction_layer is not None:
             # Scoped for import ultralytics speed: ROI align requires optional torchvision ops.
@@ -292,22 +295,47 @@ class TransformerDecoder(nn.Module):
         assert self.return_intermediate, "support return_intermediate only"
         assert self.box_refine, "support box refine only"
 
-        if compile_mode is not None:
-            self.forward = torch.compile(self.forward, mode=compile_mode, fullgraph=True)
+        self.compile_mode = compile_mode
+        self.compiled = False
+        # We defer compilation till after the first forward, to first warm-up the boxRPB cache
 
         # assign layer index to each layer so that some layers can decide what to do
         # based on which layer index they are (e.g. cross attention to memory bank only
         # in selected layers)
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.layer_idx = layer_idx
+        for layer_idx, layer in enumerate(self.layers):
+            layer.layer_idx = layer_idx
+
+    @staticmethod
+    def _get_coords(H, W, device, dtype):
+        """Get normalized coordinates for height and width."""
+        coords_h = torch.arange(0, H, dtype=dtype, device=device) / H
+        coords_w = torch.arange(0, W, dtype=dtype, device=device) / W
+        return coords_h, coords_w
 
     def _get_rpb_matrix(self, reference_boxes, feat_size):
         """Get the relative position bias (RPB) matrix for box-relative position bias."""
         H, W = feat_size
         boxes_xyxy = xywh2xyxy(reference_boxes).transpose(0, 1)
         bs, num_queries, _ = boxes_xyxy.shape
-        coords_h = torch.arange(H, device=reference_boxes.device, dtype=reference_boxes.dtype) / H
-        coords_w = torch.arange(W, device=reference_boxes.device, dtype=reference_boxes.dtype) / W
+        if self.compilable_cord_cache is None:
+            self.compilable_cord_cache = self._get_coords(H, W, reference_boxes.device, reference_boxes.dtype)
+            self.compilable_stored_size = (H, W)
+
+        if torch.compiler.is_dynamo_compiling() or self.compilable_stored_size == (
+            H,
+            W,
+        ):
+            # good, hitting the cache, will be compilable
+            coords_h, coords_w = self.compilable_cord_cache
+        else:
+            # cache miss, will create compilation issue
+            # In case we're not compiling, we'll still rely on the dict-based cache
+            if feat_size not in self.coord_cache:
+                self.coord_cache[feat_size] = self._get_coords(H, W, reference_boxes.device, reference_boxes.dtype)
+            coords_h, coords_w = self.coord_cache[feat_size]
+
+            assert coords_h.shape == (H,)
+            assert coords_w.shape == (W,)
 
         deltas_y = coords_h.view(1, -1, 1) - boxes_xyxy.reshape(-1, 1, 4)[:, :, 1:4:2]
         deltas_y = deltas_y.view(bs, num_queries, -1, 2)
@@ -356,7 +384,7 @@ class TransformerDecoder(nn.Module):
         pos: torch.Tensor = None,
         reference_boxes: torch.Tensor = None,  # num_queries, bs, 4
         # for memory
-        spatial_shapes: list[tuple[int, int]] | None = None,  # height and width of each feature level
+        spatial_shapes: torch.Tensor = None,  # bs, num_levels, 2
         valid_ratios: torch.Tensor = None,
         # for text
         memory_text: torch.Tensor = None,
@@ -434,8 +462,11 @@ class TransformerDecoder(nn.Module):
             query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, d_model
 
             if self.boxRPB != "none" and reference_boxes is not None:
-                assert len(spatial_shapes) == 1, "only single scale support implemented"
-                memory_mask = self._get_rpb_matrix(reference_boxes, spatial_shapes[0])
+                assert spatial_shapes.shape[0] == 1, "only single scale support implemented"
+                memory_mask = self._get_rpb_matrix(
+                    reference_boxes,
+                    (spatial_shapes[0, 0], spatial_shapes[0, 1]),
+                )
                 memory_mask = memory_mask.flatten(0, 1)  # (bs*n_heads, nq, H*W)
             if self.training:
                 assert self.use_act_checkpoint, "Activation checkpointing not enabled in the decoder"
@@ -499,6 +530,10 @@ class TransformerDecoder(nn.Module):
 
                 intermediate_presence_logits.append(intermediate_layer_presence_logits)
                 presence_feats = presence_out.clone()
+
+        if not self.compiled and self.compile_mode is not None:
+            self.forward = torch.compile(self.forward, mode=self.compile_mode, fullgraph=True)
+            self.compiled = True
 
         return (
             torch.stack(intermediate),

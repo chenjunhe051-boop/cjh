@@ -7,10 +7,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ultralytics.utils import LOGGER, NUM_THREADS
+from ultralytics.utils import LOGGER
 from ultralytics.utils.checks import check_requirements
 
-from .base import BaseBackend
+from .base import BaseBackend, read_tflite_metadata
 
 
 class LiteRTBackend(BaseBackend):
@@ -34,7 +34,7 @@ class LiteRTBackend(BaseBackend):
         tflite_file = Path(weight)
 
         LOGGER.info(f"Loading {tflite_file} for LiteRT inference...")
-        self.interpreter = Interpreter(str(tflite_file), num_threads=NUM_THREADS)  # Enable multi-core inference
+        self.interpreter = Interpreter(str(tflite_file))
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
@@ -42,7 +42,10 @@ class LiteRTBackend(BaseBackend):
         # load through this backend (the detection/proto outputs share the same layout for either export path).
         self.nhwc = self.input_details[0]["shape"][-1] == 3
 
-        self.apply_metadata(self.read_metadata(tflite_file))
+        # Load the metadata.json embedded in the .tflite (single self-contained file)
+        metadata = read_tflite_metadata(tflite_file)
+        if metadata:
+            self.apply_metadata(metadata)
 
     def forward(self, im: torch.Tensor) -> list[np.ndarray]:
         """Run inference using the LiteRT interpreter.
@@ -104,7 +107,7 @@ class LiteRTBackend(BaseBackend):
         if self.nhwc:
             if self.task == "segment" and len(y) > 1 and y[1].ndim == 4:
                 y[1] = np.transpose(y[1], (0, 3, 1, 2))  # protos NHWC → NCHW
-            elif self.task in {"semantic", "depth"} and len(y) == 1 and y[0].ndim == 4:
+            elif self.task == "semantic" and len(y) == 1 and y[0].ndim == 4:
                 y[0] = np.transpose(y[0], (0, 3, 1, 2))  # logits NHWC → NCHW
 
         return y

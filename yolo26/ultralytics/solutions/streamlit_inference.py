@@ -43,13 +43,16 @@ class Inference:
         inference: Perform real-time object detection inference.
 
     Examples:
-        Create an Inference instance with a custom model
-        >>> inf = Inference(model="path/to/model.pt")
-        >>> inf.inference()
+        Create an Inference instance with a custom model (not runnable as a doctest: launches a
+        Streamlit server and captures webcam/video input)::
 
-        Create an Inference instance with default settings
-        >>> inf = Inference()
-        >>> inf.inference()
+            inf = Inference(model="path/to/model.pt")
+            inf.inference()
+
+        Create an Inference instance with default settings::
+
+            inf = Inference()
+            inf.inference()
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -150,13 +153,26 @@ class Inference:
 
     def configure(self) -> None:
         """Configure the model and load selected classes for inference."""
-        # Add dropdown menu for model selection, offering the standard size/task grid in order
-        available_models = [
-            f"{size}{task}".replace("yolo", "YOLO")
-            for size in ("yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x")
-            for task in ("", "-seg", "-sem", "-depth", "-pose", "-obb", "-cls")
-            if f"{size}{task}" in GITHUB_ASSETS_STEMS
-        ]
+        # Add dropdown menu for model selection
+        M_ORD, T_ORD = (
+            ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26x"],
+            [
+                "",
+                "-seg",
+                "-sem",
+                "-pose",
+                "-obb",
+                "-cls",
+            ],
+        )
+        available_models = sorted(
+            [
+                x.replace("yolo", "YOLO")
+                for x in GITHUB_ASSETS_STEMS
+                if any(x.startswith(b) for b in M_ORD) and "grayscale" not in x
+            ],
+            key=lambda x: (M_ORD.index(x[:7].lower()), T_ORD.index(x[7:].lower() or "")),
+        )
         if self.model_path:  # Insert user provided custom model in available_models
             available_models.insert(0, self.model_path)
         selected_model = self.st.sidebar.selectbox("Model", available_models)

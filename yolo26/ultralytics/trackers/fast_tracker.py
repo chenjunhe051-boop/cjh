@@ -36,7 +36,7 @@ class FastSTrack(STrack):
 
     Examples:
         >>> from ultralytics.trackers.utils.kalman_filter import KalmanFilterXYAH
-        >>> t = FastSTrack(np.array([100, 200, 50, 80, 0]), score=0.9, cls=0, history_len=8)
+        >>> t = FastSTrack([100, 200, 50, 80, 0], score=0.9, cls=0, history_len=8)
         >>> t.activate(KalmanFilterXYAH(), frame_id=1)
         >>> len(t.mean_history)
         1
@@ -238,12 +238,9 @@ class FASTTracker(BYTETracker):
             det = detections[inew]
             if det.score < self.args.new_track_thresh:
                 continue
-            if (
-                suppress_on
-                and len(active_stack)
-                and bbox_ioa(det.xyxy[None, :], active_stack, iou=True).max() >= self.init_iou_suppress
-            ):
-                continue
+            if suppress_on and len(active_stack):
+                if bbox_ioa(det.xyxy[None, :], active_stack, iou=True).max() >= self.init_iou_suppress:
+                    continue
             det.activate(self.kalman_filter, self.frame_id)
             activated.append(det)
             active_stack = np.concatenate([active_stack, det.xyxy[None, :]], axis=0)
@@ -340,11 +337,10 @@ class FASTTracker(BYTETracker):
             if track.was_recently_occluded and (self.frame_id - track.last_occluded_frame > self.occ_reappear_window):
                 track.was_recently_occluded = False
 
-            # Give occluded tracks a grace period before marking lost.
-            if (
-                track.state != TrackState.Lost
-                and track.not_matched > 2
-                and (not track.is_occluded or track.occluded_len > self.active_occ_to_lost_thresh)
-            ):
-                track.mark_lost()
-                lost_stracks.append(track)
+            if track.state != TrackState.Lost:
+                # Give occluded tracks a grace period before marking lost.
+                if track.not_matched > 2 and (
+                    not track.is_occluded or track.occluded_len > self.active_occ_to_lost_thresh
+                ):
+                    track.mark_lost()
+                    lost_stracks.append(track)

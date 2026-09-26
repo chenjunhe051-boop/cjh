@@ -1,8 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from .ascend import onnx2ascend
 from .axelera import torch2axelera
-from .coreai import torch2coreai
 from .coreml import torch2coreml
 from .deepx import onnx2deepx
 from .engine import onnx2engine, torch2onnx
@@ -19,7 +17,6 @@ from .torchscript import torch2torchscript
 
 __all__ = [
     "keras2pb",
-    "onnx2ascend",
     "onnx2deepx",
     "onnx2engine",
     "onnx2mnn",
@@ -28,7 +25,6 @@ __all__ = [
     "onnx2saved_model",
     "tflite2edgetpu",
     "torch2axelera",
-    "torch2coreai",
     "torch2coreml",
     "torch2executorch",
     "torch2imx",

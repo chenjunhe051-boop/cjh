@@ -1,4 +1,0 @@
-train: /root/autodl-tmp/test_link/vis_test
-val: /root/autodl-tmp/test_link/vis_test
-names: [person, boat, animal, seat, sign, bicycle, car, ball, light, garbage can, uav, tricycle]
-channels: 9

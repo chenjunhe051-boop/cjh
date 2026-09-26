@@ -7,23 +7,22 @@ import copy
 import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
-from ultralytics.utils import LOGGER
+from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
-from .utils import bias_init_with_prob
+from .utils import bias_init_with_prob, linear_init
 
 __all__ = (
     "OBB",
     "Classify",
-    "Depth",
     "Detect",
     "Pose",
     "RTDETRDecoder",
@@ -87,23 +86,6 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    @staticmethod
-    def _grouped_topk(x: torch.Tensor, k: int, groups: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select exact top-k values through smaller grouped selections."""
-        n = x.shape[1]
-        while groups > 1 and (n % groups or n // groups < k):
-            groups //= 2
-        if groups == 1:  # nothing to gain, e.g. a short axis or one that does not divide evenly
-            return x.topk(k, dim=1)
-        size = n // groups
-        values, index = x.reshape(x.shape[0], groups, size).topk(k, dim=-1)
-        values, winners = values.flatten(1).topk(k, dim=1)
-        return values, winners // k * size + index.flatten(1).gather(1, winners)
-
-    def _gather(self, x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-        """Select index (batch, k) rows of x (batch, n, channels) along dim 1."""
-        return x.gather(1, index if x.ndim == 2 else index[..., None].expand(-1, -1, x.shape[-1]))
-
     def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
         """Initialize the YOLO detection layer with specified number of classes and channels.
 
@@ -144,25 +126,21 @@ class Detect(nn.Module):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3}
+        return dict(box_head=self.cv2, cls_head=self.cv3)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {"box_head": self.one2one_cv2, "cls_head": self.one2one_cv3}
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
 
     @property
     def end2end(self):
-        """Select one-to-one inference when requested or when fusion has removed the one-to-many head."""
-        return getattr(self, "one2one_cv2", None) is not None and (getattr(self, "_end2end", False) or self.cv2 is None)
+        """Checks if the model has one2one for v3/v5/v8/v9/v11 backward compatibility."""
+        return getattr(self, "_end2end", True) and hasattr(self, "one2one")
 
     @end2end.setter
     def end2end(self, value):
-        """Select the inference head without changing dual-head training."""
-        if value and getattr(self, "one2one_cv2", None) is None:
-            LOGGER.warning("This model has no one-to-one head; using one-to-many outputs.")
-        elif not value and self.cv2 is None:
-            LOGGER.warning("The one-to-many head was removed by fusion; using the remaining one-to-one head.")
+        """Override the end-to-end detection mode."""
         self._end2end = value
 
     def forward_head(
@@ -170,24 +148,24 @@ class Detect(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         if box_head is None or cls_head is None:  # for fused inference
-            return {}
+            return dict()
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
         scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
-        return {"boxes": boxes, "scores": scores, "feats": x}
+        return dict(boxes=boxes, scores=scores, feats=x)
 
     def forward(
         self, x: list[torch.Tensor]
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         preds = self.forward_head(x, **self.one2many)
-        if getattr(self, "one2one_cv2", None) is not None:
-            x_detach = [xi.detach() for xi in x] if self.training else x  # detach keeps one2one out of the backbone
+        if self.end2end:
+            x_detach = [xi.detach() for xi in x]
             one2one = self.forward_head(x_detach, **self.one2one)
             preds = {"one2many": preds, "one2one": one2one}
         if self.training:
             return preds
-        y = self._inference(preds["one2one" if self.end2end else "one2many"] if "one2one" in preds else preds)
+        y = self._inference(preds["one2one"] if self.end2end else preds)
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
         return y if self.export else (y, preds)
@@ -222,7 +200,7 @@ class Detect(nn.Module):
             b[-1].bias.data[: self.nc] = math.log(
                 5 / self.nc / (640 / self.stride[i]) ** 2
             )  # cls (.01 objects, 80 classes, 640 img)
-        if getattr(self, "one2one_cv2", None) is not None:
+        if self.end2end:
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
                 a[-1].bias.data[:] = 2.0  # box
                 b[-1].bias.data[: self.nc] = math.log(
@@ -242,18 +220,17 @@ class Detect(nn.Module):
         """Post-processes YOLO model predictions.
 
         Args:
-            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + extra) with last
-                dimension format [x1, y1, x2, y2, class_probs, extra], where extra holds the mask coefficients,
-                keypoints or angle of the Segment, Pose and OBB heads and is empty for Detect.
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
+                format [x1, y1, x2, y2, class_probs].
 
         Returns:
-            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + extra) and last
-                dimension format [x1, y1, x2, y2, max_class_prob, class_index, extra].
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
+                dimension format [x1, y1, x2, y2, max_class_prob, class_index].
         """
-        # Segment, Pose and OBB carry task channels after the class scores, Detect has none
-        boxes, scores, *extra = preds.split([s for s in (4, self.nc, preds.shape[-1] - 4 - self.nc) if s], dim=-1)
+        boxes, scores = preds.split([4, self.nc], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
-        return torch.cat([self._gather(boxes, idx), scores, conf, *(self._gather(e, idx) for e in extra)], dim=-1)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        return torch.cat([boxes, scores, conf], dim=-1)
 
     def get_topk_index(self, scores: torch.Tensor, max_det: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get top-k indices from scores.
@@ -265,24 +242,26 @@ class Detect(nn.Module):
         Returns:
             (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
         """
-        anchors, nc = scores.shape[1:]  # i.e. shape(16,8400,80)
-        k = min(max_det, anchors)
+        _, anchors, nc = scores.shape  # i.e. shape(16,8400,80)
+        # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
+        # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
+        k = max_det if self.export else min(max_det, anchors)
         if self.agnostic_nms:
-            scores, labels = scores.max(dim=-1)
-            scores, index = self._grouped_topk(scores, k, 1)
-            return scores[..., None], self._gather(labels[..., None].float(), index), index
-        groups = 8 if self.export and self.format == "engine" and not self.dynamic else 1
-        ori_index = self._grouped_topk(scores.max(dim=-1)[0], k, groups)[1]
-        scores = self._gather(scores, ori_index)
-        scores, index = self._grouped_topk(scores.flatten(1), k, groups)
-        return scores[..., None], (index % nc)[..., None].float(), self._gather(ori_index, index // nc)
+            scores, labels = scores.max(dim=-1, keepdim=True)
+            scores, indices = scores.topk(k, dim=1)
+            labels = labels.gather(1, indices)
+            return scores, labels, indices
+        ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
+        scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
+        scores, index = scores.flatten(1).topk(k)
+        # NOTE: torch.gather 与高级索引语义等价，但 ONNX 有原生 GatherElements 对应，
+        # 避免 aten::index 在导出时被拼装为不等价算子组合（torch 2.5.1 + onnx 1.22.0 下坐标列错位）
+        idx = torch.gather(ori_index, 1, (index // nc).unsqueeze(-1))  # original index
+        return scores[..., None], (index % nc)[..., None].float(), idx
 
     def fuse(self) -> None:
-        """Remove the unused detection branch for inference."""
-        end2end = self.end2end
-        for name in tuple(self._modules):
-            if name.startswith("one2one_"):
-                setattr(self, name[8:] if end2end else name, None)
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = None
 
 
 class Segment(Detect):
@@ -330,12 +309,12 @@ class Segment(Detect):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3, "mask_head": self.cv4}
+        return dict(box_head=self.cv2, cls_head=self.cv3, mask_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {"box_head": self.one2one_cv2, "cls_head": self.one2one_cv3, "mask_head": self.one2one_cv4}
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, mask_head=self.one2one_cv4)
 
     def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
@@ -343,7 +322,7 @@ class Segment(Detect):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x[0])  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if "one2one" in preds:
+            if self.end2end:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -366,6 +345,27 @@ class Segment(Detect):
             bs = x[0].shape[0]  # batch size
             preds["mask_coefficient"] = torch.cat([mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
         return preds
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process YOLO model predictions.
+
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nm) with last dimension
+                format [x1, y1, x2, y2, class_probs, mask_coefficient].
+
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + nm) and last
+                dimension format [x1, y1, x2, y2, max_class_prob, class_index, mask_coefficient].
+        """
+        boxes, scores, mask_coefficient = preds.split([4, self.nc, self.nm], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coefficient = mask_coefficient.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        return torch.cat([boxes, scores, conf, mask_coefficient], dim=-1)
+
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = None
 
 
 class Segment26(Segment):
@@ -409,7 +409,7 @@ class Segment26(Segment):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x)  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if "one2one" in preds:
+            if self.end2end:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = (
                     tuple(p.detach() for p in proto) if isinstance(proto, tuple) else proto.detach()
@@ -421,7 +421,7 @@ class Segment26(Segment):
         return (outputs, proto) if self.export else ((outputs[0], proto), preds)
 
     def fuse(self) -> None:
-        """Remove the unused detection branch and training-only prototype layers for inference."""
+        """Remove the one2many head and extra part of proto module for inference optimization."""
         super().fuse()
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
@@ -469,12 +469,12 @@ class OBB(Detect):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3, "angle_head": self.cv4}
+        return dict(box_head=self.cv2, cls_head=self.cv3, angle_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {"box_head": self.one2one_cv2, "cls_head": self.one2one_cv3, "angle_head": self.one2one_cv4}
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, angle_head=self.one2one_cv4)
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with rotation angles."""
@@ -500,6 +500,27 @@ class OBB(Detect):
     def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
         """Decode rotated bounding boxes."""
         return dist2rbox(bboxes, self.angle, anchors, dim=1)
+
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process YOLO model predictions.
+
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + ne) with last dimension
+                format [x, y, w, h, class_probs, angle].
+
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 7) and last
+                dimension format [x, y, w, h, max_class_prob, class_index, angle].
+        """
+        boxes, scores, angle = preds.split([4, self.nc, self.ne], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        angle = angle.gather(dim=1, index=idx.repeat(1, 1, self.ne))
+        return torch.cat([boxes, scores, conf, angle], dim=-1)
+
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = None
 
 
 class OBB26(OBB):
@@ -579,12 +600,12 @@ class Pose(Detect):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3, "pose_head": self.cv4}
+        return dict(box_head=self.cv2, cls_head=self.cv3, pose_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {"box_head": self.one2one_cv2, "cls_head": self.one2one_cv3, "pose_head": self.one2one_cv4}
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, pose_head=self.one2one_cv4)
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with keypoints."""
@@ -601,6 +622,27 @@ class Pose(Detect):
             preds["kpts"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
         return preds
 
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process YOLO model predictions.
+
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nk) with last dimension
+                format [x1, y1, x2, y2, class_probs, keypoints].
+
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + self.nk) and
+                last dimension format [x1, y1, x2, y2, max_class_prob, class_index, keypoints].
+        """
+        boxes, scores, kpts = preds.split([4, self.nc, self.nk], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        kpts = kpts.gather(dim=1, index=idx.repeat(1, 1, self.nk))
+        return torch.cat([boxes, scores, conf, kpts], dim=-1)
+
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = self.cv4 = None
+
     def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
         """Decode keypoints from predictions."""
         ndim = self.kpt_shape[1]
@@ -614,7 +656,10 @@ class Pose(Detect):
         else:
             y = kpts.clone()
             if ndim == 3:
-                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+                if NOT_MACOS14:
+                    y[:, 2::ndim].sigmoid_()
+                else:  # Apple macOS14 MPS bug https://github.com/ultralytics/ultralytics/pull/21878
+                    y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
             y[:, 0::ndim] = (y[:, 0::ndim] * 2.0 + (self.anchors[0] - 0.5)) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (self.anchors[1] - 0.5)) * self.strides
             return y
@@ -669,24 +714,24 @@ class Pose26(Pose):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for backward compatibility."""
-        return {
-            "box_head": self.cv2,
-            "cls_head": self.cv3,
-            "pose_head": self.cv4,
-            "kpts_head": self.cv4_kpts,
-            "kpts_sigma_head": self.cv4_sigma,
-        }
+        return dict(
+            box_head=self.cv2,
+            cls_head=self.cv3,
+            pose_head=self.cv4,
+            kpts_head=self.cv4_kpts,
+            kpts_sigma_head=self.cv4_sigma,
+        )
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {
-            "box_head": self.one2one_cv2,
-            "cls_head": self.one2one_cv3,
-            "pose_head": self.one2one_cv4,
-            "kpts_head": self.one2one_cv4_kpts,
-            "kpts_sigma_head": self.one2one_cv4_sigma,
-        }
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            pose_head=self.one2one_cv4,
+            kpts_head=self.one2one_cv4_kpts,
+            kpts_sigma_head=self.one2one_cv4_sigma,
+        )
 
     def forward_head(
         self,
@@ -710,10 +755,9 @@ class Pose26(Pose):
         return preds
 
     def fuse(self) -> None:
-        """Remove the unused detection branch and training-only layers for inference."""
+        """Remove the one2many head for inference optimization."""
         super().fuse()
-        self.flow_model = None
-        setattr(self, "one2one_cv4_sigma" if self.end2end else "cv4_sigma", None)
+        self.cv4_kpts = self.cv4_sigma = self.flow_model = self.one2one_cv4_sigma = None
 
     def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
         """Decode keypoints from predictions."""
@@ -729,92 +773,13 @@ class Pose26(Pose):
         else:
             y = kpts.clone()
             if ndim == 3:
-                y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
+                if NOT_MACOS14:
+                    y[:, 2::ndim].sigmoid_()
+                else:  # Apple macOS14 MPS bug https://github.com/ultralytics/ultralytics/pull/21878
+                    y[:, 2::ndim] = y[:, 2::ndim].sigmoid()
             y[:, 0::ndim] = (y[:, 0::ndim] + self.anchors[0]) * self.strides
             y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
             return y
-
-
-class Depth(nn.Module):
-    """YOLO Depth head for monocular depth estimation.
-
-    A dense prediction head that takes multi-scale backbone features and produces a single-channel depth map via
-    progressive upsampling and fusion.
-
-    Attributes:
-        nl (int): Number of pyramid levels.
-        cal_a (torch.Tensor): Log-affine calibration scale buffer, identity 1.0 by default.
-        cal_b (torch.Tensor): Log-affine calibration offset buffer, identity 0.0 by default.
-
-    Examples:
-        >>> depth = Depth(ch=(256, 512, 1024))
-        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
-        >>> out = depth(x)  # training: {"depth": (1, 1, 160, 160)} at P2 resolution (input/4)
-    """
-
-    export = False  # export mode
-
-    def __init__(self, c_mid: int = 256, ch: tuple = ()):
-        """Initialize Depth head.
-
-        Args:
-            c_mid (int): Number of intermediate channels for the fusion decoder.
-            ch (tuple): Input channel sizes from backbone feature maps (P3, P4, P5).
-        """
-        super().__init__()
-        self.nl = len(ch)  # number of detection layers (pyramid levels)
-
-        # Project each pyramid level to c_mid channels
-        self.proj = nn.ModuleList(Conv(c, c_mid, k=1) for c in ch)
-
-        # Refinement blocks after each of the nl-1 fusion steps (the coarsest level is not refined)
-        self.refine = nn.ModuleList(nn.Sequential(Conv(c_mid, c_mid, k=3), Conv(c_mid, c_mid, k=3)) for _ in ch[:-1])
-
-        self.head = nn.Sequential(
-            Conv(c_mid, c_mid // 2, k=3),
-            nn.ConvTranspose2d(c_mid // 2, c_mid // 2, kernel_size=2, stride=2, bias=True),
-            Conv(c_mid // 2, c_mid // 4, k=3),
-            nn.Conv2d(c_mid // 4, 1, kernel_size=1),
-        )
-        # Initialize to ~1.2 m so early exp() outputs stay well-conditioned.
-        self.head[-1].bias.data.fill_(0.182)
-
-        # Scale-only log-affine calibration d' = exp(a·log d + b); identity by default.
-        self.register_buffer("cal_a", torch.ones(1))
-        self.register_buffer("cal_b", torch.zeros(1))
-
-    def forward(self, x: list[torch.Tensor]) -> dict[str, torch.Tensor] | torch.Tensor:
-        """Fuse multi-scale features and predict depth.
-
-        Args:
-            x: List of feature tensors [P3, P4, P5] from the backbone/neck.
-
-        Returns:
-            Training: dict {"depth": (B, 1, H/4, W/4)}, the raw head output the loss supervises.
-            Eval: (B, 1, H/4, W/4) with calibration applied; the predictor/validator resize to image/GT size.
-            Export (self.export=True): (B, 1, H, W), upsampled 4x to the input size. Output is unbounded.
-        """
-        # Project all levels to same channel dim
-        feats = [self.proj[i](x[i]) for i in range(self.nl)]
-
-        out = feats[-1]
-        for i in range(self.nl - 2, -1, -1):
-            # align_corners=True is baked into the released depth weights. Constant scale (consecutive pyramid
-            # levels) keeps the upsample static for dynamic-shape CoreML export; output size is identical.
-            out = F.interpolate(out, scale_factor=2, mode="bilinear", align_corners=True)
-            out = out + feats[i]
-            out = self.refine[i](out)
-
-        out = self.head(out)  # (B, 1, H/4, W/4)
-        depth = torch.exp(out.clamp(-4.0, 5.0))
-
-        if self.training:
-            return {"depth": depth}
-
-        depth = depth.pow(self.cal_a) * self.cal_b.exp()
-        if self.export:
-            depth = F.interpolate(depth, scale_factor=4.0, mode="bilinear", align_corners=False)
-        return depth
 
 
 class Classify(nn.Module):
@@ -918,14 +883,14 @@ class WorldDetect(Detect):
 
     def forward(self, x: list[torch.Tensor], text: torch.Tensor) -> dict[str, torch.Tensor] | tuple:
         """Concatenate and return predicted bounding boxes and class probabilities."""
-        feats = list(x)  # snapshot references for anchor generation; the loop below reassigns x[i], never mutates
+        feats = [xi.clone() for xi in x]  # save original features for anchor generation
         for i in range(self.nl):
             x[i] = torch.cat((self.cv2[i](x[i]), self.cv4[i](self.cv3[i](x[i]), text)), 1)
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
         bs = x[0].shape[0]
         x_cat = torch.cat([xi.view(bs, self.no, -1) for xi in x], 2)
         boxes, scores = x_cat.split((self.reg_max * 4, self.nc), 1)
-        preds = {"boxes": boxes, "scores": scores, "feats": feats}
+        preds = dict(boxes=boxes, scores=scores, feats=feats)
         if self.training:
             return preds
         y = self._inference(preds)
@@ -984,7 +949,7 @@ class LRPCHead(nn.Module):
     def conv2linear(conv: nn.Conv2d) -> nn.Linear:
         """Convert a 1x1 convolutional layer to a linear layer."""
         assert isinstance(conv, nn.Conv2d) and conv.kernel_size == (1, 1)
-        linear = nn.Linear(conv.in_channels, conv.out_channels).requires_grad_(conv.weight.requires_grad)
+        linear = nn.Linear(conv.in_channels, conv.out_channels)
         linear.weight.data = conv.weight.view(conv.out_channels, -1).data
         linear.bias.data = conv.bias.data
         return linear
@@ -992,9 +957,6 @@ class LRPCHead(nn.Module):
     def forward(self, cls_feat: torch.Tensor, loc_feat: torch.Tensor, conf: float) -> tuple[tuple, torch.Tensor]:
         """Process classification and localization features to generate detection proposals."""
         if self.enabled:
-            if not conf:  # static export, every anchor passes the proposal filter
-                cls_feat = self.vocab(cls_feat.flatten(2).transpose(-1, -2))
-                return self.loc(loc_feat), cls_feat.transpose(-1, -2), None
             pf_score = self.pf(cls_feat)[0, 0].flatten(0)
             mask = pf_score.sigmoid() > conf
             cls_feat = cls_feat.flatten(2).transpose(-1, -2)
@@ -1080,20 +1042,20 @@ class YOLOEDetect(Detect):
         self.savpe = SAVPE(ch, c3, embed)
         self.embed = embed
 
-    @smart_inference_mode(False)  # fused layers stay in the model, so they must not be inference tensors
+    @smart_inference_mode()
     def fuse(self, txt_feats: torch.Tensor = None):
         """Fuse text features with model weights for efficient inference."""
-        if txt_feats is None:  # remove the unused detection branch
-            super().fuse()
+        if txt_feats is None:  # means eliminate one2many branch
+            self.cv2 = self.cv3 = self.cv4 = None
             return
         if self.is_fused:
             return
 
         assert not self.training
-        txt_feats = txt_feats.to(next(self.parameters()).dtype).squeeze(0)
+        txt_feats = txt_feats.to(torch.float32).squeeze(0)
         if self.cv3 and self.cv4:
             self._fuse_tp(txt_feats, self.cv3, self.cv4)
-        if getattr(self, "one2one_cv2", None) is not None:
+        if self.end2end:
             self._fuse_tp(txt_feats, self.one2one_cv3, self.one2one_cv4)
         del self.reprta
         self.reprta = nn.Identity()
@@ -1127,7 +1089,7 @@ class YOLOEDetect(Detect):
                     kernel_size=1,
                 )
                 .requires_grad_(False)
-                .to(conv.weight.device, conv.weight.dtype)
+                .to(conv.weight.device)
             )
 
             conv.weight.data.copy_(w.unsqueeze(-1).unsqueeze(-1))
@@ -1159,23 +1121,21 @@ class YOLOEDetect(Detect):
         """Process features with fused text embeddings to generate detections for prompt-free model."""
         boxes, scores, index = [], [], []
         bs = x[0].shape[0]
-        cv2 = self.one2one_cv2 if self.end2end else self.cv2
-        cv3 = self.one2one_cv3 if self.end2end else self.cv3
-        conf = 0 if self.export and not self.dynamic else getattr(self, "conf", 0.001)
+        cv2 = self.cv2 if not self.end2end else self.one2one_cv2
+        cv3 = self.cv3 if not self.end2end else self.one2one_cv3
         for i in range(self.nl):
             cls_feat = cv3[i](x[i])
             loc_feat = cv2[i](x[i])
             assert isinstance(self.lrpc[i], LRPCHead)
-            box, score, idx = self.lrpc[i](cls_feat, loc_feat, conf)
+            box, score, idx = self.lrpc[i](
+                cls_feat,
+                loc_feat,
+                0 if self.export and not self.dynamic else getattr(self, "conf", 0.001),
+            )
             boxes.append(box.view(bs, self.reg_max * 4, -1))
             scores.append(score)
             index.append(idx)
-        preds = {
-            "boxes": torch.cat(boxes, 2),
-            "scores": torch.cat(scores, 2),
-            "feats": x,
-            "index": torch.cat(index) if conf else None,
-        }
+        preds = dict(boxes=torch.cat(boxes, 2), scores=torch.cat(scores, 2), feats=x, index=torch.cat(index))
         y = self._inference(preds)
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
@@ -1185,24 +1145,24 @@ class YOLOEDetect(Detect):
         """Decode predicted bounding boxes for inference."""
         dbox = super()._get_decode_boxes(x)
         if hasattr(self, "lrpc"):
-            dbox = dbox if x["index"] is None else dbox[..., x["index"]]
+            dbox = dbox if self.export and not self.dynamic else dbox[..., x["index"]]
         return dbox
 
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3, "contrastive_head": self.cv4}
+        return dict(box_head=self.cv2, cls_head=self.cv3, contrastive_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {"box_head": self.one2one_cv2, "cls_head": self.one2one_cv3, "contrastive_head": self.one2one_cv4}
+        return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, contrastive_head=self.one2one_cv4)
 
     def forward_head(self, x, box_head, cls_head, contrastive_head):
         """Concatenates and returns predicted bounding boxes, class probabilities, and contrastive scores."""
         assert len(x) == 4, f"Expected 4 features including 3 feature maps and 1 text embeddings, but got {len(x)}."
         if box_head is None or cls_head is None:  # for fused inference
-            return {}
+            return dict()
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
         self.nc = x[-1].shape[1]
@@ -1210,7 +1170,7 @@ class YOLOEDetect(Detect):
             [contrastive_head[i](cls_head[i](x[i]), x[-1]).reshape(bs, self.nc, -1) for i in range(self.nl)], dim=-1
         )
         self.no = self.nc + self.reg_max * 4  # self.nc could be changed when inference with different texts
-        return {"boxes": boxes, "scores": scores, "feats": x[:3]}
+        return dict(boxes=boxes, scores=scores, feats=x[:3])
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
@@ -1220,7 +1180,7 @@ class YOLOEDetect(Detect):
             a[-1].bias.data[:] = 2.0  # box
             b[-1].bias.data[:] = 0.0
             c.bias.data[:] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
-        if getattr(self, "one2one_cv2", None) is not None:
+        if self.end2end:
             for i, (a, b, c) in enumerate(
                 zip(self.one2one["box_head"], self.one2one["cls_head"], self.one2one["contrastive_head"])
             ):
@@ -1288,43 +1248,46 @@ class YOLOESegment(YOLOEDetect):
     @property
     def one2many(self):
         """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
-        return {"box_head": self.cv2, "cls_head": self.cv3, "mask_head": self.cv5, "contrastive_head": self.cv4}
+        return dict(box_head=self.cv2, cls_head=self.cv3, mask_head=self.cv5, contrastive_head=self.cv4)
 
     @property
     def one2one(self):
         """Returns the one-to-one head components."""
-        return {
-            "box_head": self.one2one_cv2,
-            "cls_head": self.one2one_cv3,
-            "mask_head": self.one2one_cv5,
-            "contrastive_head": self.one2one_cv4,
-        }
+        return dict(
+            box_head=self.one2one_cv2,
+            cls_head=self.one2one_cv3,
+            mask_head=self.one2one_cv5,
+            contrastive_head=self.one2one_cv4,
+        )
 
     def forward_lrpc(self, x: list[torch.Tensor]) -> torch.Tensor | tuple:
         """Process features with fused text embeddings to generate detections for prompt-free model."""
         boxes, scores, index = [], [], []
         bs = x[0].shape[0]
-        cv2 = self.one2one_cv2 if self.end2end else self.cv2
-        cv3 = self.one2one_cv3 if self.end2end else self.cv3
-        cv5 = self.one2one_cv5 if self.end2end else self.cv5
-        conf = 0 if self.export and not self.dynamic else getattr(self, "conf", 0.001)
+        cv2 = self.cv2 if not self.end2end else self.one2one_cv2
+        cv3 = self.cv3 if not self.end2end else self.one2one_cv3
+        cv5 = self.cv5 if not self.end2end else self.one2one_cv5
         for i in range(self.nl):
             cls_feat = cv3[i](x[i])
             loc_feat = cv2[i](x[i])
             assert isinstance(self.lrpc[i], LRPCHead)
-            box, score, idx = self.lrpc[i](cls_feat, loc_feat, conf)
+            box, score, idx = self.lrpc[i](
+                cls_feat,
+                loc_feat,
+                0 if self.export and not self.dynamic else getattr(self, "conf", 0.001),
+            )
             boxes.append(box.view(bs, self.reg_max * 4, -1))
             scores.append(score)
             index.append(idx)
         mc = torch.cat([cv5[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
-        index = torch.cat(index) if conf else None
-        preds = {
-            "boxes": torch.cat(boxes, 2),
-            "scores": torch.cat(scores, 2),
-            "feats": x,
-            "index": index,
-            "mask_coefficient": mc if index is None else mc[..., index],
-        }
+        index = torch.cat(index)
+        preds = dict(
+            boxes=torch.cat(boxes, 2),
+            scores=torch.cat(scores, 2),
+            feats=x,
+            index=index,
+            mask_coefficient=mc * index.int() if self.export and not self.dynamic else mc[..., index],
+        )
         y = self._inference(preds)
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
@@ -1336,7 +1299,7 @@ class YOLOESegment(YOLOEDetect):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x[0])  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if "one2one" in preds:
+            if self.end2end:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -1365,10 +1328,28 @@ class YOLOESegment(YOLOEDetect):
             preds["mask_coefficient"] = torch.cat([mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
         return preds
 
+    def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
+        """Post-process YOLO model predictions.
+
+        Args:
+            preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nm) with last dimension
+                format [x1, y1, x2, y2, class_probs, mask_coefficient].
+
+        Returns:
+            (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + nm) and last
+                dimension format [x1, y1, x2, y2, max_class_prob, class_index, mask_coefficient].
+        """
+        boxes, scores, mask_coefficient = preds.split([4, self.nc, self.nm], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        boxes = boxes.gather(dim=1, index=idx.repeat(1, 1, 4))
+        mask_coefficient = mask_coefficient.gather(dim=1, index=idx.repeat(1, 1, self.nm))
+        return torch.cat([boxes, scores, conf, mask_coefficient], dim=-1)
+
     def fuse(self, txt_feats: torch.Tensor = None):
         """Fuse text features with model weights for efficient inference."""
         super().fuse(txt_feats)
-        if txt_feats is None:  # remove training-only prototype layers
+        if txt_feats is None:  # means eliminate one2many branch
+            self.cv5 = None
             if hasattr(self.proto, "fuse"):
                 self.proto.fuse()
             return
@@ -1427,7 +1408,7 @@ class YOLOESegment26(YOLOESegment):
         proto = self.proto([xi.detach() for xi in x], return_semantic=False)  # mask protos
 
         if isinstance(preds, dict):  # training and validating during training
-            if "one2one" in preds:  # dual-head outputs, not prompt-free
+            if self.end2end and not hasattr(self, "lrpc"):  # not prompt-free
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -1495,7 +1476,7 @@ class RTDETRDecoder(nn.Module):
         ndl: int = 6,  # num decoder layers
         d_ffn: int = 1024,  # dim of feedforward
         dropout: float = 0.0,
-        act: nn.Module | None = None,
+        act: nn.Module = nn.ReLU(),
         eval_idx: int = -1,
         # Training args
         nd: int = 100,  # num denoising
@@ -1523,7 +1504,6 @@ class RTDETRDecoder(nn.Module):
             learnt_init_query (bool): Whether to learn initial query embeddings.
         """
         super().__init__()
-        act = nn.ReLU() if act is None else act
         self.hidden_dim = hd
         self.nhead = nh
         self.nl = len(ch)  # num level
@@ -1627,8 +1607,7 @@ class RTDETRDecoder(nn.Module):
                 export, and last dimension format [cx, cy, w, h, max_class_prob, class_index].
         """
         k = min(self.num_queries, self.max_det) if self.export else self.num_queries
-        groups = 8 if self.export and self.format == "engine" and not self.dynamic else 1
-        scores, index = Detect._grouped_topk(scores.flatten(1), k, groups)
+        scores, index = scores.flatten(1).topk(k)
         # CoreML MIL lacks integer floor-div and mod lowering: use torch.div(rounding_mode="floor") and (index - q*nc).
         query_idx = torch.div(index, self.nc, rounding_mode="floor")
         boxes = boxes.gather(dim=1, index=query_idx.unsqueeze(-1).expand(-1, -1, 4).long())
@@ -1731,8 +1710,7 @@ class RTDETRDecoder(nn.Module):
 
         # Query selection
         # (bs*num_queries,)
-        groups = 8 if self.export and self.format == "engine" and not self.dynamic else 1
-        topk_ind = Detect._grouped_topk(enc_outputs_scores.max(-1).values, self.num_queries, groups)[1].view(-1)
+        topk_ind = torch.topk(enc_outputs_scores.max(-1).values, self.num_queries, dim=1).indices.view(-1)
         # (bs*num_queries,)
         batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
 
@@ -1763,14 +1741,18 @@ class RTDETRDecoder(nn.Module):
         """Initialize or reset the parameters of the model's various components with predefined weights and biases."""
         # Class and bbox head init
         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+        # NOTE: the weight initialization in `linear_init` would cause NaN when training with custom datasets.
+        # linear_init(self.enc_score_head)
         constant_(self.enc_score_head.bias, bias_cls)
         constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
         constant_(self.enc_bbox_head.layers[-1].bias, 0.0)
         for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
+            # linear_init(cls_)
             constant_(cls_.bias, bias_cls)
             constant_(reg_.layers[-1].weight, 0.0)
             constant_(reg_.layers[-1].bias, 0.0)
 
+        linear_init(self.enc_output[0])
         xavier_uniform_(self.enc_output[0].weight)
         if self.learnt_init_query:
             xavier_uniform_(self.tgt_embed.weight)
@@ -1796,7 +1778,7 @@ class v10Detect(Detect):
         __init__: Initialize the v10Detect object with specified number of classes and input channels.
         forward: Perform forward pass of the v10Detect module.
         bias_init: Initialize biases of the Detect module.
-        fuse: Remove the unused detection branch for inference.
+        fuse: Remove the one2many head for inference optimization.
 
     Examples:
         Create a v10Detect head
@@ -1804,6 +1786,8 @@ class v10Detect(Detect):
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
         >>> outputs = v10_detect(x)
     """
+
+    end2end = True
 
     def __init__(self, nc: int = 80, ch: tuple = ()):
         """Initialize the v10Detect object with the specified number of classes and input channels.
@@ -1825,6 +1809,10 @@ class v10Detect(Detect):
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
 
+    def fuse(self):
+        """Remove the one2many head for inference optimization."""
+        self.cv2 = self.cv3 = None
+
 
 class SemanticSegment(nn.Module):
     """YOLO semantic segmentation head for per-pixel classification.
@@ -1844,7 +1832,7 @@ class SemanticSegment(nn.Module):
 
     export = False  # export mode
     format = None  # export format
-    bake_argmax = False  # export: emit [B, H, W] class map (TensorRT>=10 and multi-class Hailo-10/15)
+    bake_argmax = False  # export: emit a baked [B, H, W] class map (set by the exporter for TensorRT>=10)
 
     def __init__(self, nc=19, ch=()):
         """Initialize the semantic segmentation head.
@@ -1872,9 +1860,9 @@ class SemanticSegment(nn.Module):
 
         Returns:
             (torch.Tensor | tuple): Logits of shape [B, nc, H/8, W/8] during training (or a (main, aux) tuple when
-                aux_head is present) and inference. ONNX, MNN, OpenVINO, TensorRT>=10, and multi-class Hailo-10/15
-                export bake in the class reduction and return a compact map of shape [B, H, W] (uint8 when nc <= 256,
-                else int32). Other export formats return upsampled logits of shape [B, nc, H, W].
+                aux_head is present) and inference. ONNX, MNN, and TensorRT>=10 export bake in the argmax and return a
+                compact class map of shape [B, H, W] (uint8 when nc <= 256, else int32). Other export formats return
+                upsampled logits of shape [B, nc, H, W].
         """
         # Classify
         logits = self.classifier(x[0])  # [B, nc, H/8, W/8]
@@ -1884,10 +1872,9 @@ class SemanticSegment(nn.Module):
             return logits
         if self.export:
             y = F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)  # [B, nc, H, W]
-            # Bake class reduction: emit [B, H, W] map, shrinking the D2H copy ~80x. ONNX/MNN/OpenVINO and
-            # multi-class Hailo-10/15 preserve the integer output; TensorRT supports uint8 graph outputs only on
-            # TRT>=10, so engine and Hailo baking are gated by the exporter.
-            if self.format in {"onnx", "mnn", "openvino"} or (self.format in {"engine", "hailo"} and self.bake_argmax):
+            # Bake argmax: emit [B, H, W] class map, shrinking the D2H copy ~80x. ONNX/MNN preserve the
+            # integer output; TensorRT only supports uint8 graph outputs on TRT>=10, so engine is gated by the exporter.
+            if self.format in {"onnx", "mnn"} or (self.format == "engine" and self.bake_argmax):
                 cls = y.argmax(1) if self.nc > 1 else y.squeeze(1) > 0
                 return cls.to(torch.uint8 if self.nc <= 256 else torch.int32)
             return y

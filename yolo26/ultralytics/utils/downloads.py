@@ -10,7 +10,6 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from urllib import parse
-from uuid import uuid4
 
 from ultralytics.utils import ASSETS_URL, LOGGER, TQDM, checks, clean_url, emojis, is_online, url2file
 
@@ -20,10 +19,7 @@ GITHUB_ASSETS_NAMES = frozenset(
     [f"yolov8{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb", "-oiv7")]
     + [f"yolo11{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb")]
     + [f"yolo12{k}{suffix}.pt" for k in "nsmlx" for suffix in ("",)]  # detect models only currently
-    + [f"yolo26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-sem", "-pose", "-obb", "-depth")]
-    + [f"yolo26{k}-objv1{suffix}.pt" for k in "nsmlx" for suffix in ("-150", "-seg")]
-    + [f"yolo26{k}-{suffix}.pt" for k in "nsmlx" for suffix in ("distill", "sem-ade20k")]
-    + [f"yolo26{k}-reid.onnx" for k in "nsmlx"]
+    + [f"yolo26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-sem", "-pose", "-obb")]
     + [f"yolov5{k}{resolution}u.pt" for k in "nsmlx" for resolution in ("", "6")]
     + [f"yolov3{k}u.pt" for k in ("", "-spp", "-tiny")]
     + [f"yolov8{k}-world.pt" for k in "smlx"]
@@ -32,7 +28,6 @@ GITHUB_ASSETS_NAMES = frozenset(
     + [f"yoloe-11{k}{suffix}.pt" for k in "sml" for suffix in ("-seg", "-seg-pf")]
     + [f"yoloe-26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("-seg", "-seg-pf")]
     + [f"yolov9{k}.pt" for k in "tsmce"]
-    + [f"yolov9{k}-seg.pt" for k in "ce"]
     + [f"yolov10{k}.pt" for k in "nsmblx"]
     + [f"yolo_nas_{k}.pt" for k in "sml"]
     + [f"sam_{k}.pt" for k in "bl"]
@@ -43,9 +38,7 @@ GITHUB_ASSETS_NAMES = frozenset(
     + [
         "mobile_sam.pt",
         "mobileclip_blt.ts",
-        "mobileclip2_b.ts",
         "yolo11n-grayscale.pt",
-        "yolov8x-pose-p6.pt",
         "calibration_image_sample_data_20x128x128x3_float32.npy.zip",
     ]
 )
@@ -81,11 +74,11 @@ def is_url(url: str | Path, check: bool = False) -> bool:
 
 
 def delete_dsstore(path: str | Path, files_to_delete: tuple[str, ...] = (".DS_Store", "__MACOSX")) -> None:
-    """Delete all specified system files and directories in a directory.
+    """Delete all specified system files in a directory.
 
     Args:
         path (str | Path): The directory path where the files should be deleted.
-        files_to_delete (tuple[str, ...]): Names of files and directories to delete.
+        files_to_delete (tuple[str, ...]): The files to be deleted.
 
     Examples:
         >>> from ultralytics.utils.downloads import delete_dsstore
@@ -96,9 +89,9 @@ def delete_dsstore(path: str | Path, files_to_delete: tuple[str, ...] = (".DS_St
         are hidden system files and can cause issues when transferring files between different operating systems.
     """
     for file in files_to_delete:
-        matches = sorted(Path(path).rglob(file), key=lambda x: len(x.parts), reverse=True)
+        matches = list(Path(path).rglob(file))
         LOGGER.info(f"Deleting {file} files: {matches}")
-        for f in matches:
+        for f in sorted(matches, key=lambda entry: len(entry.parts), reverse=True):
             if f.is_dir() and not f.is_symlink():
                 shutil.rmtree(f)
             else:
@@ -130,13 +123,12 @@ def zip_directory(
     """
     from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
-    delete_dsstore(directory)
     directory = Path(directory)
     if not directory.is_dir():
         raise FileNotFoundError(f"Directory '{directory}' does not exist.")
 
     # Zip with progress bar
-    files = [f for f in directory.rglob("*") if f.is_file() and all(x not in f.name for x in exclude)]  # files to zip
+    files = [f for f in directory.rglob("*") if f.is_file() and not any(part in exclude for part in f.relative_to(directory).parts)]  # files to zip
     zip_file = directory.with_suffix(".zip")
     compression = ZIP_DEFLATED if compress else ZIP_STORED
     with ZipFile(zip_file, "w", compression) as f:
@@ -222,7 +214,7 @@ def unzip_file(
 
 def check_disk_space(
     file_bytes: int,
-    path: str | Path | None = None,
+    path: str | Path = Path.cwd(),
     sf: float = 1.5,
     hard: bool = True,
 ) -> bool:
@@ -237,15 +229,11 @@ def check_disk_space(
     Returns:
         (bool): True if there is sufficient disk space, False otherwise.
     """
-    total, _used, free = shutil.disk_usage(path or Path.cwd())  # bytes
-    # A filesystem that cannot report usage returns 0 total blocks; free == 0 against a valid total is genuinely
-    # full and must still be caught, since `free` counts blocks available to an unprivileged process.
-    if not total or file_bytes * sf < free:
+    _total, _used, free = shutil.disk_usage(path)  # bytes
+    if file_bytes * sf < free:
         return True  # sufficient space
 
     def fmt_bytes(b):
-        if b < (1 << 20):  # without a KB tier every value under 51 KB renders "0.0 MB", hiding how full the disk is
-            return f"{b / (1 << 10):.1f} KB"
         return f"{b / (1 << 20):.1f} MB" if b < (1 << 30) else f"{b / (1 << 30):.3f} GB"
 
     # Insufficient space
@@ -352,25 +340,16 @@ def safe_download(
             uri = (url if gdrive else clean_url(url)).replace(ASSETS_URL, "https://ultralytics.com/assets")  # clean
             desc = f"Downloading {uri} to '{f}'"
             f.parent.mkdir(parents=True, exist_ok=True)  # make directory if missing
-            target = f
-            f = target.with_name(f".{target.name}.{uuid4().hex}.part")  # publish only after size validation
             curl_installed = shutil.which("curl")
             expected_size = None  # set from Content-Length; reused to validate curl retries
             for i in range(retry + 1):
                 try:
                     if (curl or i > 0) and curl_installed:  # curl download with retry, continue
                         s = "sS" * (not progress)  # silent
-                        # Stall bounds (not a total-transfer cap): abort if <1 B/s for 300 s so a dead connection
-                        # cannot block interpreter shutdown while a non-daemon plot thread waits on a font download
-                        args = ["--connect-timeout", "30", "--speed-limit", "1", "--speed-time", "300"]
-                        r = subprocess.run(
-                            ["curl", "-#", f"-{s}L", url, "-o", f, "--retry", "3", "-C", "-", *args], check=False
-                        ).returncode
+                        r = subprocess.run(["curl", "-#", f"-{s}L", url, "-o", f, "--retry", "3", "-C", "-"]).returncode
                         assert r == 0, f"Curl return value {r}"
-                    else:  # requests download; timeout bounds connect and per-chunk read gaps, not total transfer
-                        with requests.get(
-                            url, stream=True, headers={"Accept-Encoding": "identity"}, timeout=(30, 300)
-                        ) as response:
+                    else:  # requests download
+                        with requests.get(url, stream=True, headers={"Accept-Encoding": "identity"}) as response:
                             response.raise_for_status()
                             expected_size = int(response.headers.get("Content-Length", 0))
                             if i == 0 and expected_size > 1048576:
@@ -383,10 +362,11 @@ def safe_download(
                                 unit="B",
                                 unit_scale=True,
                                 unit_divisor=1024,
-                            ) as pbar, open(f, "wb") as f_opened:
-                                for data in response.iter_content(chunk_size=buffer_size):
-                                    f_opened.write(data)
-                                    pbar.update(len(data))
+                            ) as pbar:
+                                with open(f, "wb") as f_opened:
+                                    for data in response.iter_content(chunk_size=buffer_size):
+                                        f_opened.write(data)
+                                        pbar.update(len(data))
 
                     if f.exists():
                         file_size = f.stat().st_size
@@ -397,28 +377,20 @@ def safe_download(
                                     f"Partial download: {file_size}/{expected_size} bytes ({file_size / expected_size * 100:.1f}%)"
                                 )
                             else:
-                                f.replace(target)
-                                f = target
                                 break  # success
                         f.unlink()  # remove partial downloads
                 except MemoryError:
                     raise  # Re-raise immediately - no point retrying if insufficient disk space
                 except Exception as e:
-                    # Only on the terminal failure: retries resume the partial file via curl `-C -`, but leaving
-                    # one behind makes the `not f.is_file()` guard above serve it as a complete cache hit forever.
                     if i == 0 and not is_online():
-                        f.unlink(missing_ok=True)
                         raise ConnectionError(
                             emojis(f"❌  Download failure for {uri}. Environment may be offline.")
                         ) from e
                     elif i >= retry:
-                        f.unlink(missing_ok=True)
                         raise ConnectionError(
                             emojis(f"❌  Download failure for {uri}. Retry limit reached. {e}")
                         ) from e
                     LOGGER.warning(f"Download failure, retrying {i + 1}/{retry} {uri}... {e}")
-            else:  # no attempt reached `break`, so every one failed size validation and unlinked its download
-                raise ConnectionError(emojis(f"❌  Download failure for {uri}. Retry limit reached."))
 
     if unzip and f.exists() and f.suffix in {"", ".zip", ".tar", ".gz"}:
         from zipfile import is_zipfile
@@ -446,10 +418,10 @@ def safe_download(
                         target.mkdir(parents=True, exist_ok=True)
                     elif source := tar.extractfile(m):
                         target.parent.mkdir(parents=True, exist_ok=True)
-                        with source, open(target, "wb") as out:  # 'f' is the archive path, deleted below
-                            shutil.copyfileobj(source, out)
+                        with source, open(target, "wb") as f:
+                            shutil.copyfileobj(source, f)
         if delete:
-            f.unlink()  # remove archive
+            f.unlink()  # remove zip
         return unzip_dir
     return f
 
@@ -526,36 +498,44 @@ def attempt_download_asset(
     file = Path(file.strip().replace("'", ""))
     if file.exists():
         return str(file)
-    elif (SETTINGS["weights_dir"] / file).exists():
+    if (SETTINGS["weights_dir"] / file).exists():
         return str(SETTINGS["weights_dir"] / file)
-    else:
-        # URL specified
-        name = Path(parse.unquote(str(file))).name  # decode '%2F' to '/' etc.
-        download_url = f"https://github.com/{repo}/releases/download"
-        if str(file).startswith(("http:/", "https:/")):  # download
-            url = str(file).replace(":/", "://")  # Pathlib turns :// -> :/
-            file = url2file(name)  # parse authentication query strings
-            if Path(file).is_file():
-                LOGGER.info(f"Found {clean_url(url)} locally at {file}")  # file already exists
-            else:
-                safe_download(url=url, file=file, min_bytes=1e5, **kwargs)
+    if file.suffix.lower() in {".yaml", ".yml"} and "://" not in str(file):
+        # YAML model definitions live in the repository and are not release
+        # assets. Resolve a missing absolute/cache path by basename before
+        # attempting any network lookup.
+        local_file = checks.check_yaml(file.name, hard=False)
+        if local_file:
+            return str(local_file)
 
-        elif repo == GITHUB_ASSETS_REPO and name in GITHUB_ASSETS_NAMES:
-            safe_download(url=f"{download_url}/{release}/{name}", file=file, min_bytes=1e5, **kwargs)
-
+    # URL or release asset specified. YAML files that were not found locally
+    # continue through the existing behavior and return the unresolved path.
+    name = Path(parse.unquote(str(file))).name  # decode '%2F' to '/' etc.
+    download_url = f"https://github.com/{repo}/releases/download"
+    if str(file).startswith(("http:/", "https:/")):  # download
+        url = str(file).replace(":/", "://")  # Pathlib turns :// -> :/
+        file = url2file(name)  # parse authentication query strings
+        if Path(file).is_file():
+            LOGGER.info(f"Found {clean_url(url)} locally at {file}")  # file already exists
         else:
-            tag, assets = get_github_assets(repo, release)
-            if not assets:
-                tag, assets = get_github_assets(repo)  # latest release
-            if name in assets:
-                safe_download(url=f"{download_url}/{tag}/{name}", file=file, min_bytes=1e5, **kwargs)
+            safe_download(url=url, file=file, min_bytes=1e5, **kwargs)
 
-        return str(file)
+    elif repo == GITHUB_ASSETS_REPO and name in GITHUB_ASSETS_NAMES:
+        safe_download(url=f"{download_url}/{release}/{name}", file=file, min_bytes=1e5, **kwargs)
+
+    else:
+        tag, assets = get_github_assets(repo, release)
+        if not assets:
+            tag, assets = get_github_assets(repo)  # latest release
+        if name in assets:
+            safe_download(url=f"{download_url}/{tag}/{name}", file=file, min_bytes=1e5, **kwargs)
+
+    return str(file)
 
 
 def download(
     url: str | list[str] | Path,
-    dir: Path | None = None,
+    dir: Path = Path.cwd(),
     unzip: bool = True,
     delete: bool = False,
     curl: bool = False,
@@ -580,7 +560,7 @@ def download(
     Examples:
         >>> download("https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg", dir="path/to/dir")
     """
-    dir = Path(dir or Path.cwd())
+    dir = Path(dir)
     dir.mkdir(parents=True, exist_ok=True)  # make directory
     urls = [url] if isinstance(url, (str, Path)) else url
     if threads > 1:

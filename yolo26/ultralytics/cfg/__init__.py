@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
+import json
+import math
 import os
 import shutil
 import subprocess
@@ -20,7 +23,6 @@ from ultralytics.utils import (
     FLOAT_OR_INT,
     IS_VSCODE,
     LOGGER,
-    PLATFORM_URL,
     RANK,
     ROOT,
     SETTINGS,
@@ -55,44 +57,44 @@ SOLUTION_MAP = {
     "help": None,
 }
 
-# Define valid tasks and modes, ordered as they appear across the docs and Ultralytics Platform
-MODES = ("train", "val", "predict", "export", "track", "benchmark")
-TASKS = ("detect", "segment", "semantic", "depth", "classify", "pose", "obb")
+# Define valid tasks and modes
+MODES = frozenset({"train", "val", "predict", "export", "track", "benchmark"})
+TASKS = frozenset({"detect", "segment", "classify", "pose", "obb", "semantic", "multitask"})
 TASK2DATA = {
     "detect": "coco8.yaml",
     "segment": "coco8-seg.yaml",
-    "semantic": "cityscapes8.yaml",
-    "depth": "depth8.yaml",
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
+    "semantic": "cityscapes8.yaml",
+    "multitask": "coco-multitask.yaml",
 }
 TASK2CALIBRATIONDATA = {
     "detect": "coco128.yaml",
     "segment": "coco128-seg.yaml",
-    "semantic": "cityscapes8.yaml",
-    "depth": "depth8.yaml",
     "classify": "imagenet100",
     "pose": "coco8-pose.yaml",
     "obb": "dota128.yaml",
+    "semantic": "cityscapes8.yaml",
+    "multitask": "coco128.yaml",
 }
 TASK2MODEL = {
     "detect": "yolo26n.pt",
     "segment": "yolo26n-seg.pt",
-    "semantic": "yolo26n-sem.pt",
-    "depth": "yolo26n-depth.pt",
     "classify": "yolo26n-cls.pt",
     "pose": "yolo26n-pose.pt",
     "obb": "yolo26n-obb.pt",
+    "semantic": "yolo26n-sem.pt",
+    "multitask": "yolo26-master-mt-n.yaml",
 }
 TASK2METRIC = {
     "detect": "metrics/mAP50-95(B)",
     "segment": "metrics/mAP50-95(M)",
-    "semantic": "metrics/mIoU",
-    "depth": "metrics/delta1",
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
+    "semantic": "metrics/mIoU",
+    "multitask": "metrics/mAP50-95(B)",
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
@@ -166,14 +168,13 @@ CLI_HELP_MSG = f"""
         yolo checks
         yolo version
         yolo settings
-        yolo login API_KEY
-        yolo logout
+        yolo mixtures kind=mot task=detect family=master/v0_10
         yolo copy-cfg
         yolo cfg
         yolo solutions help
 
     Docs: https://docs.ultralytics.com
-    Platform: https://platform.ultralytics.com
+    Solutions: https://docs.ultralytics.com/solutions/
     Community: https://community.ultralytics.com
     GitHub: https://github.com/ultralytics/ultralytics
     """
@@ -195,32 +196,105 @@ QUANTIZE_ALIASES = {
     "w8a16": "w8a16",
     "w8a32": "w8a32",
 }
-QUANTIZE_DOCS_URL = "https://docs.ultralytics.com/modes/export#quantization-options"
+QUANTIZE_DOCS_URL = "https://docs.ultralytics.com/modes/export/#quantization-options"
 QUANTIZE_VALID_VALUES = "8, 16, 32, 'int8', 'fp16', 'fp32', 'w8a8', 'w16a16', 'w8a16', or 'w8a32'"
 
 # Define keys for arg type checks
+MIXTURE_FLOAT_KEYS = frozenset(
+    {
+        "lora_auto_r_ratio",
+        "lora_beta1",
+        "lora_beta2",
+        "lora_dropout",
+        "lora_dropout_end",
+        "lora_dropout_start_ratio",
+        "lora_few_shot_distill_weight",
+        "lora_few_shot_distill_weight_max",
+        "lora_few_shot_distill_weight_min",
+        "lora_few_shot_dropconnect",
+        "lora_sensitivity_top_ratio",
+        "lora_sensitivity_beta",
+        "lora_few_shot_dropconnect_max",
+        "lora_few_shot_dropconnect_min",
+        "lora_few_shot_ema_decay",
+        "lora_few_shot_rank_budget",
+        "lora_few_shot_response_distill_weight",
+        "lora_layer_decay",
+        "lora_lr_mult",
+        "lora_oft_eps",
+        "lora_orth_reg_weight",
+        "lora_ortho_weight",
+        "latent_aux_gain",
+        "mixture_aux_budget",
+        "moa_aux_gain",
+        "moa_aux_loss_coeff",
+        "moa_mot_min_temperature",
+        "moa_mot_temperature_factor",
+        "moa_temperature",
+        "moe",
+        "moe_aux_gain",
+        "moe_balance_loss",
+        "moe_collapse_threshold",
+        "moe_dynamic_balance_max",
+        "moe_dynamic_balance_min",
+        "moe_dynamic_gini_alpha",
+        "moe_dynamic_gini_beta",
+        "moe_dynamic_gini_target",
+        "moe_map_saturation_decay_factor",
+        "moe_map_saturation_min_scale",
+        "moe_map_saturation_threshold",
+        "moe_noise_std",
+        "moe_router_lr_scale",
+        "moe_router_z_loss",
+        "moe_temperature",
+        "moe_weight_threshold",
+        "moe_prune_threshold",
+        "molora_balance_loss",
+        "molora_capacity_factor",
+        "molora_diversity_loss",
+        "molora_expert_dropout",
+        "molora_router_z_loss",
+        "mot_aux_gain",
+        "mot_balance_loss",
+        "mot_router_z_loss",
+        "mot_scene_consistency",
+        "mot_temperature",
+        "objectness_threshold",
+        "overlap_ratio",
+        "sigma",
+    }
+)
+STAL_FLOAT_KEYS = frozenset({"stal_candidate_scale", "stal_medium_area", "stal_small_area"})
+# fmt: off
 CFG_FLOAT_KEYS = frozenset(
     {  # integer or float arguments, i.e. x=2 and x=2.0
         "warmup_epochs",
         "box",
         "cls",
         "dfl",
-        "pose",
-        "kobj",
-        "rle",
-        "angle",
-        "dlog",
-        "dgrad",
         "dis",
+        "foundation_cosine_weight",
+        "foundation_foreground_weight",
+        "foundation_boundary_weight",
+        "foundation_background_weight",
+        "foundation_loss_weight",
+        "foundation_relation_weight",
+        "foundation_router_loss_weight",
+        "foundation_router_temperature",
+        "foundation_semantic_loss_weight",
+        "foundation_semantic_text_weight",
+        "foundation_semantic_image_weight",
+        "foundation_semantic_temperature",
+        "foundation_multitask_negative_transfer_threshold",
         "degrees",
         "shear",
         "time",
         "workspace",
         "batch",
     }
-)
+) | MIXTURE_FLOAT_KEYS | STAL_FLOAT_KEYS
 CFG_FRACTION_KEYS = frozenset(
-    {  # fractional floats use [0.0, 1.0]; dataset fraction also accepts positive counts and split pairs
+    {  # fractional floats use [0.0, 1.0], except dataset fraction uses (0.0, 1.0]
         "dropout",
         "lr0",
         "lrf",
@@ -241,14 +315,53 @@ CFG_FRACTION_KEYS = frozenset(
         "mixup",
         "cutmix",
         "copy_paste",
-        "erasing",
         "conf",
         "iou",
         "fraction",
         "multi_scale",
-        "dlam",
     }
 )
+MIXTURE_INT_KEYS = frozenset(
+    {
+        "lora_alpha",
+        "lora_alpha_warmup",
+        "lora_boft_block_num",
+        "lora_boft_block_size",
+        "lora_boft_n_butterfly_factor",
+        "lora_delta_t",
+        "lora_init_r",
+        "lora_min_channels",
+        "lora_oft_block_size",
+        "lora_ortho_frequency",
+        "lora_r",
+        "lora_target_r",
+        "lora_tfinal",
+        "lora_tinit",
+        "lora_total_step",
+        "lora_adapter_budget",
+        "lora_sensitivity_num_batches",
+        "lora_sensitivity_max_layers",
+        "moa_local_window_size",
+        "moa_regional_max_kv_tokens",
+        "moe_expert_warmup_epochs",
+        "moe_map_saturation_window_size",
+        "moe_num_experts",
+        "moe_top_k",
+        "molora_alpha",
+        "molora_num_experts",
+        "molora_r",
+        "molora_top_k",
+        "molora_warmup_steps",
+        "moe_prune_keep_top_m",
+        "moe_prune_calibration_steps",
+        "mot_sparse_train_warmup_steps",
+        "mot_local_attn_window",
+        "foundation_align_dim",
+        "foundation_relation_samples",
+        "slice_size",
+    }
+)
+STAL_INT_KEYS = frozenset({"stal_min_candidates", "stal_topk_large", "stal_topk_medium", "stal_topk_small"})
 CFG_INT_KEYS = frozenset(
     {  # integer-only arguments
         "epochs",
@@ -263,14 +376,63 @@ CFG_INT_KEYS = frozenset(
         "nbs",
         "save_period",
     }
-)
+) | MIXTURE_INT_KEYS | STAL_INT_KEYS
 CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, sizes or seeds
     "nbs": 1,
     "max_det": 1,
     "mask_ratio": 1,
     "vid_stride": 1,
     "seed": 0,
+    "moe_prune_calibration_steps": 1,
+    "mot_sparse_train_warmup_steps": 0,
+    "mot_local_attn_window": 0,
+    "foundation_align_dim": 1,
+    "foundation_relation_samples": 1,
+    "moa_regional_max_kv_tokens": 0,
 }
+MIXTURE_BOOL_KEYS = frozenset(
+    {
+        "cluster",
+        "lora_allow_depthwise",
+        "lora_allow_rtdetr_dora",
+        "lora_few_shot_adaptive_rank",
+        "lora_few_shot_adaptive_temperature",
+        "lora_few_shot_curriculum_sampling",
+        "lora_few_shot_gradient_importance_weighted",
+        "lora_few_shot_hierarchical_distill",
+        "lora_few_shot_hook_cache",
+        "lora_few_shot_layerwise_rank",
+        "lora_few_shot_mode",
+        "lora_few_shot_response_distill",
+        "lora_few_shot_use_ema_teacher",
+        "lora_few_shot_variational_rank",
+        "lora_freeze_bn",
+        "lora_gradient_checkpointing",
+        "lora_hra_apply_gs",
+        "lora_include_attention",
+        "lora_include_head",
+        "lora_include_moe",
+        "lora_oft_block_share",
+        "lora_oft_coft",
+        "lora_only_3x3",
+        "lora_only_backbone",
+        "lora_planner_enabled",
+        "lora_sensitivity_select",
+        "lora_sensitivity_keep_risky",
+        "lora_save_adapters",
+        "lora_skip_stem",
+        "lora_use_dora",
+        "lora_use_rslora",
+        "moe_map_saturation_enabled",
+        "molora_share_moe_registry",
+        "molora_use_rslora",
+        "mot_scene_aware_router",
+        "mot_sparse_train",
+        "sparse_sahi",
+        "sparse_sahi_fallback",
+        "weighted",
+    }
+)
 CFG_BOOL_KEYS = frozenset(
     {  # boolean-only arguments
         "save",
@@ -302,12 +464,100 @@ CFG_BOOL_KEYS = frozenset(
         "dynamic",
         "simplify",
         "nms",
+        "pre_export_prune",
         "profile",
-        "channels_last",
+        "end2end",
         "cls_remap",
+        "foundation_cache_teacher_features",
+        "foundation_enabled",
+        "foundation_foreground_weighting",
+        "foundation_multiscale",
+        "foundation_router_distill",
+        "foundation_router_native_state",
+        "foundation_semantic_distill",
+        "foundation_multitask",
+        "foundation_multitask_enabled",
+    }
+) | MIXTURE_BOOL_KEYS
+MIXTURE_STR_KEYS = frozenset(
+    {
+        "iou_type",
+        "lora_adapter_dir",
+        "lora_backend",
+        "lora_bias",
+        "lora_few_shot_distill_schedule",
+        "lora_few_shot_dropconnect_schedule",
+        "lora_quantization",
+        "lora_type",
+        "lora_variant",
+        "lora_planner_solver",
+        "lora_planner_backend",
+        "molora_expert_init",
+        "molora_router_type",
+        "molora_export_mode",
+        "mot_scene_inference_mode",
     }
 )
-CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})
+STAL_STR_KEYS = frozenset({"stal_mode"})
+CFG_STR_KEYS = frozenset(
+    {
+        "optimizer",
+        "split",
+        "copy_paste_mode",
+        "auto_augment",
+        "foundation_teacher",
+        "foundation_backend",
+        "foundation_loss",
+        "foundation_teacher_dtype",
+        "foundation_relation_mode",
+        "foundation_semantic_prompt_template",
+        "foundation_dinov3_model",
+        "foundation_siglip2_model",
+        "foundation_dinov3_weights",
+        "foundation_siglip2_weights",
+    }
+) | MIXTURE_STR_KEYS | STAL_STR_KEYS
+FOUNDATION_TEACHERS = frozenset({"none", "dinov3", "siglip2", "multi"})
+FOUNDATION_BACKENDS = frozenset({"transformers", "local"})
+FOUNDATION_LOSSES = frozenset({"cosine", "l2", "relational", "hybrid"})
+FOUNDATION_RELATION_MODES = frozenset({"sampled", "full"})
+FOUNDATION_DTYPES = frozenset({"auto", "fp32", "fp16", "bf16"})
+FOUNDATION_TARGET_LEVELS = frozenset({"p3", "p4", "p5"})
+STAL_MODES = frozenset({"tal", "fixed", "adaptive"})
+# fmt: on
+LORA_RUNTIME_METADATA_KEYS = frozenset(
+    {
+        "effective_lora_backend",
+        "effective_lora_init_lora_weights",
+        "effective_lora_type",
+        "effective_lora_variant",
+        "effective_optimizer",
+        "effective_optimizer_lrs",
+        "lora_planner_adapted",
+        "lora_planner_refused",
+        "lora_safety_overrides",
+        "lora_safety_profile",
+        "lora_target_audit",
+        "planner_decision",
+        "planner_predicted_delta",
+        "planner_recommended_rank",
+        "planner_recommended_variant",
+        "planner_refusal_reason",
+        "requested_lora_backend",
+        "requested_lora_init_lora_weights",
+        # AdapterRuntimeController records the original request separately
+        # from any safety-adjusted effective value. These audit-only fields
+        # may flow through a copied trainer namespace into validation, but
+        # are not independent YOLO configuration arguments.
+        "requested_lora_alpha_warmup",
+        "requested_lora_layer_decay",
+        "requested_lora_lr_mult",
+        "requested_lora_ortho_weight",
+        "requested_lora_use_dora",
+        "requested_lora_use_rslora",
+        "requested_lora_variant",
+    }
+)
 
 
 def cfg2dict(cfg: str | Path | dict | SimpleNamespace) -> dict:
@@ -368,7 +618,7 @@ def get_cfg(
           `project` and `name` to strings and validating configuration keys and values.
         - The function performs type and value checks on the configuration data.
     """
-    cfg = _handle_deprecation(cfg2dict(cfg))
+    cfg = cfg2dict(cfg)
 
     # Merge overrides
     if overrides:
@@ -381,11 +631,13 @@ def get_cfg(
         if k in cfg and isinstance(cfg[k], FLOAT_OR_INT):
             cfg[k] = str(cfg[k])
     if cfg.get("name") == "model":  # assign model to 'name' arg
-        cfg["name"] = Path(str(cfg.get("model") or "")).stem
+        cfg["name"] = str(cfg.get("model", "")).partition(".")[0]
         LOGGER.warning(f"'name=model' automatically updated to 'name={cfg['name']}'.")
 
     # Type and Value checks
     check_cfg(cfg)
+    validate_stal_config(cfg)
+    validate_foundation_config(cfg)
 
     # Return instance
     return IterableSimpleNamespace(**cfg)
@@ -416,13 +668,11 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
     Notes:
         - The function modifies the input dictionary in-place.
         - None values are ignored as they may be from optional arguments.
-        - Fraction keys use [0.0, 1.0]; dataset fraction also accepts counts and [train, val, test] lists.
+        - Fraction keys use [0.0, 1.0], except dataset fraction, which uses (0.0, 1.0].
     """
     typed_keys = CFG_FLOAT_KEYS | CFG_FRACTION_KEYS | CFG_INT_KEYS | CFG_BOOL_KEYS | CFG_STR_KEYS | {"scale", "compile"}
     for k, v in cfg.items():
-        if v is None and (
-            k == "amp" or (DEFAULT_CFG_DICT.get(k) is not None and k in typed_keys and k != "auto_augment")
-        ):
+        if v is None and DEFAULT_CFG_DICT.get(k) is not None and k in typed_keys and k != "auto_augment":
             raise TypeError(f"'{k}=None' is invalid. '{k}' must not be None.")
         if v is not None:  # None values may be from optional args
             if k in CFG_FLOAT_KEYS and not isinstance(v, FLOAT_OR_INT):
@@ -452,17 +702,6 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                 if not (0.0 <= v <= 1.0):
                     raise ValueError(f"'{k}={v}' is an invalid value. Valid '{k}' values are between 0.0 and 1.0.")
             elif k in CFG_FRACTION_KEYS:
-                if k == "fraction" and isinstance(v, list):
-                    if (
-                        len(v) not in {2, 3}
-                        or not all(v[:2])
-                        or not all((type(x) is int and x >= 0) or (type(x) is float and 0.0 <= x <= 1.0) for x in v)
-                    ):
-                        raise ValueError(f"'{k}={v}' is invalid. Use [train, val] or [train, val, test] counts/ratios.")
-                    cfg[k] = [float(x) if x in {0, 1} else x for x in v]
-                    continue
-                if k == "fraction" and isinstance(v, bool):
-                    raise TypeError(f"'{k}={v}' is of invalid type bool. Valid '{k}' types are int, float, or list")
                 if not isinstance(v, FLOAT_OR_INT):
                     if hard:
                         raise TypeError(
@@ -470,11 +709,8 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                             f"Valid '{k}' types are int (i.e. '{k}=0') or float (i.e. '{k}=0.5')"
                         )
                     cfg[k] = v = float(v)
-                valid = 0.0 <= v <= 1.0 or (k == "fraction" and isinstance(v, int) and v > 1)
-                if not valid or (k == "fraction" and v == 0.0):
-                    raise ValueError(f"'{k}={v}' invalid. Use integer count >1 or ratio (0, 1] for fraction.")
-                if k == "fraction" and v == 1:
-                    cfg[k] = 1.0
+                if not (0.0 <= v <= 1.0) or (k == "fraction" and v == 0.0):
+                    raise ValueError(f"'{k}={v}' is invalid. Use (0.0, 1.0] for fraction; [0.0, 1.0] otherwise.")
             elif k in CFG_INT_KEYS:
                 if not isinstance(v, int):
                     if hard:
@@ -484,6 +720,12 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                     cfg[k] = v = int(v)
                 if k in CFG_INT_MIN and v < CFG_INT_MIN[k]:
                     raise ValueError(f"'{k}={v}' is an invalid value. '{k}' must be >= {CFG_INT_MIN[k]}.")
+            # fmt: off
+            elif k == "lora_init_lora_weights" and not isinstance(v, (bool, str)):
+                if hard:
+                    raise TypeError(f"'{k}={v}' is of invalid type {type(v).__name__}. '{k}' must be a bool or str.")
+                cfg[k] = bool(v)
+            # fmt: on
             elif k in CFG_BOOL_KEYS and not isinstance(v, bool):
                 if hard:
                     raise TypeError(
@@ -502,12 +744,6 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         f"'{k}' must be a bool or str (i.e. '{k}=True' or '{k}=max-autotune')"
                     )
                 cfg[k] = bool(v)
-            elif k == "amp":
-                if not isinstance(v, bool) and str(v).lower() not in {"fp16", "bf16", "fp32"}:
-                    raise ValueError(
-                        f"'{k}={v}' is invalid. Valid '{k}' values are True, False, 'fp16', 'bf16', or 'fp32'."
-                    )
-                cfg[k] = v.lower() if isinstance(v, str) else v
             elif k == "quantize":  # canonicalize 8/16/32 or w-notation to a scheme (unset stays None for FP32)
                 scheme = QUANTIZE_ALIASES.get(str(v).lower())
                 if scheme is None:
@@ -518,6 +754,263 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         )
                 else:
                     cfg[k] = scheme
+
+
+def validate_stal_config(cfg: dict) -> None:
+    """Validate small-target adaptive label-assignment values and relationships."""
+    mode = cfg.get("stal_mode", DEFAULT_CFG_DICT["stal_mode"])
+    small_area = cfg.get("stal_small_area", DEFAULT_CFG_DICT["stal_small_area"])
+    medium_area = cfg.get("stal_medium_area", DEFAULT_CFG_DICT["stal_medium_area"])
+    candidate_scale = cfg.get("stal_candidate_scale", DEFAULT_CFG_DICT["stal_candidate_scale"])
+    min_candidates = cfg.get("stal_min_candidates", DEFAULT_CFG_DICT["stal_min_candidates"])
+    topks = {
+        name: cfg.get(name, DEFAULT_CFG_DICT[name])
+        for name in ("stal_topk_small", "stal_topk_medium", "stal_topk_large")
+    }
+
+    if not isinstance(mode, str):
+        raise TypeError(f"'stal_mode={mode}' is of invalid type {type(mode).__name__}. 'stal_mode' must be a str.")
+    if mode not in STAL_MODES:
+        raise ValueError(f"'stal_mode={mode}' is invalid. Valid values are {sorted(STAL_MODES)}.")
+
+    for name, value in {
+        "stal_small_area": small_area,
+        "stal_medium_area": medium_area,
+        "stal_candidate_scale": candidate_scale,
+    }.items():
+        if isinstance(value, bool) or not isinstance(value, FLOAT_OR_INT):
+            raise TypeError(f"'{name}={value}' must be an int or float.")
+        if not math.isfinite(value):
+            raise ValueError(f"'{name}={value}' must be finite.")
+    if small_area <= 0 or medium_area <= 0 or small_area >= medium_area:
+        raise ValueError("'stal_small_area' and 'stal_medium_area' must satisfy 0 < small < medium.")
+    if not 1.0 <= candidate_scale <= 4.0:
+        raise ValueError("'stal_candidate_scale' must be between 1.0 and 4.0.")
+
+    integer_values = {"stal_min_candidates": min_candidates, **topks}
+    for name, value in integer_values.items():
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"'{name}={value}' must be an int.")
+        if not 1 <= value <= 64:
+            raise ValueError(f"'{name}={value}' is invalid. Use an integer between 1 and 64.")
+    if any(value < min_candidates for value in topks.values()):
+        raise ValueError("Every adaptive STAL top-k must be greater than or equal to 'stal_min_candidates'.")
+
+
+def _foundation_transformers_available() -> bool:
+    """Return whether the optional Transformers package can be discovered without importing it."""
+    try:
+        return importlib.util.find_spec("transformers") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def validate_foundation_config(cfg: dict) -> None:
+    """Validate the opt-in, training-only Foundation Teacher configuration boundary.
+
+    This function validates configuration combinations only. It never imports a teacher backend or loads model
+    weights, so the default disabled path remains independent of optional Foundation dependencies.
+
+    Args:
+        cfg (dict): Merged YOLO configuration dictionary.
+
+    Raises:
+        TypeError: If a Foundation-specific value has an invalid type.
+        ValueError: If a Foundation-specific value or combination is unsupported.
+        ImportError: If an enabled Transformers-backed teacher needs an unavailable optional dependency.
+    """
+    teacher = cfg.get("foundation_teacher", DEFAULT_CFG_DICT["foundation_teacher"])
+    backend = cfg.get("foundation_backend", DEFAULT_CFG_DICT["foundation_backend"])
+    loss = cfg.get("foundation_loss", DEFAULT_CFG_DICT["foundation_loss"])
+    dtype = cfg.get("foundation_teacher_dtype", DEFAULT_CFG_DICT["foundation_teacher_dtype"])
+    target_levels = cfg.get("foundation_target_levels", DEFAULT_CFG_DICT["foundation_target_levels"])
+    align_dim = cfg.get("foundation_align_dim", DEFAULT_CFG_DICT["foundation_align_dim"])
+    relation_mode = cfg.get("foundation_relation_mode", DEFAULT_CFG_DICT["foundation_relation_mode"])
+    relation_samples = cfg.get("foundation_relation_samples", DEFAULT_CFG_DICT["foundation_relation_samples"])
+    router_temperature = cfg.get("foundation_router_temperature", DEFAULT_CFG_DICT["foundation_router_temperature"])
+    router_teachers = cfg.get("foundation_router_teachers", DEFAULT_CFG_DICT.get("foundation_router_teachers"))
+    router_native_state = cfg.get(
+        "foundation_router_native_state", DEFAULT_CFG_DICT.get("foundation_router_native_state", True)
+    )
+    semantic_distill = bool(cfg.get("foundation_semantic_distill", DEFAULT_CFG_DICT["foundation_semantic_distill"]))
+    semantic_loss_weight = cfg.get(
+        "foundation_semantic_loss_weight", DEFAULT_CFG_DICT["foundation_semantic_loss_weight"]
+    )
+    semantic_temperature = cfg.get(
+        "foundation_semantic_temperature", DEFAULT_CFG_DICT.get("foundation_semantic_temperature", 0.07)
+    )
+    multitask_flag = cfg.get("foundation_multitask", DEFAULT_CFG_DICT.get("foundation_multitask", False))
+    multitask_alias = cfg.get(
+        "foundation_multitask_enabled", DEFAULT_CFG_DICT.get("foundation_multitask_enabled", False)
+    )
+    if not isinstance(multitask_flag, bool) or not isinstance(multitask_alias, bool):
+        raise TypeError("'foundation_multitask' and 'foundation_multitask_enabled' must be bool values.")
+    multitask_enabled = multitask_flag or multitask_alias
+    multitask_tasks = cfg.get("foundation_multitask_tasks", DEFAULT_CFG_DICT.get("foundation_multitask_tasks"))
+    negative_transfer_threshold = cfg.get(
+        "foundation_multitask_negative_transfer_threshold",
+        DEFAULT_CFG_DICT.get("foundation_multitask_negative_transfer_threshold", 4.0),
+    )
+
+    if teacher not in FOUNDATION_TEACHERS:
+        raise ValueError(f"'foundation_teacher={teacher}' is invalid. Valid values are {sorted(FOUNDATION_TEACHERS)}.")
+    if backend not in FOUNDATION_BACKENDS:
+        raise ValueError(f"'foundation_backend={backend}' is invalid. Valid values are {sorted(FOUNDATION_BACKENDS)}.")
+    if loss not in FOUNDATION_LOSSES:
+        raise ValueError(f"'foundation_loss={loss}' is invalid. Valid values are {sorted(FOUNDATION_LOSSES)}.")
+    if dtype not in FOUNDATION_DTYPES:
+        raise ValueError(
+            f"'foundation_teacher_dtype={dtype}' is invalid. Valid values are {sorted(FOUNDATION_DTYPES)}."
+        )
+
+    if not isinstance(target_levels, (list, tuple)) or not target_levels:
+        raise TypeError("'foundation_target_levels' must be a non-empty list of feature level names.")
+    if any(not isinstance(level, str) for level in target_levels):
+        raise TypeError("'foundation_target_levels' must contain only strings.")
+    unknown_levels = sorted(set(target_levels) - FOUNDATION_TARGET_LEVELS)
+    if unknown_levels:
+        raise ValueError(
+            f"'foundation_target_levels' contains unsupported levels {unknown_levels}. "
+            f"Valid levels are {sorted(FOUNDATION_TARGET_LEVELS)}."
+        )
+    if len(set(target_levels)) != len(target_levels):
+        raise ValueError("'foundation_target_levels' must not contain duplicate levels.")
+    multiscale = cfg.get("foundation_multiscale", DEFAULT_CFG_DICT.get("foundation_multiscale", False))
+    if multiscale and len(target_levels) < 2:
+        raise ValueError("'foundation_multiscale=True' requires at least two target levels.")
+    if isinstance(align_dim, bool) or not isinstance(align_dim, int) or align_dim <= 0:
+        raise ValueError(f"'foundation_align_dim={align_dim}' is invalid. It must be a positive integer.")
+    if relation_mode not in FOUNDATION_RELATION_MODES:
+        raise ValueError(
+            f"'foundation_relation_mode={relation_mode}' is invalid. "
+            f"Valid values are {sorted(FOUNDATION_RELATION_MODES)}."
+        )
+    if isinstance(relation_samples, bool) or not isinstance(relation_samples, int) or relation_samples <= 0:
+        raise ValueError(f"'foundation_relation_samples={relation_samples}' is invalid. It must be a positive integer.")
+    if isinstance(router_temperature, bool) or float(router_temperature) <= 0:
+        raise ValueError(f"'foundation_router_temperature={router_temperature}' is invalid. It must be positive.")
+    if not isinstance(router_teachers, (list, tuple)) or not router_teachers:
+        raise TypeError("'foundation_router_teachers' must be a non-empty list of teacher names.")
+    if any(not isinstance(name, str) for name in router_teachers):
+        raise TypeError("'foundation_router_teachers' must contain only strings.")
+    router_teachers = tuple(name.lower() for name in router_teachers)
+    if any(name not in {"dinov3", "siglip2"} for name in router_teachers):
+        raise ValueError("'foundation_router_teachers' supports only 'dinov3' and 'siglip2'.")
+    if not isinstance(router_native_state, bool):
+        raise TypeError("'foundation_router_native_state' must be a bool.")
+    if multitask_tasks is not None:
+        if not isinstance(multitask_tasks, (list, tuple, set)):
+            raise TypeError("'foundation_multitask_tasks' must be a list of task names when provided.")
+        if any(not isinstance(name, str) for name in multitask_tasks):
+            raise TypeError("'foundation_multitask_tasks' must contain only strings.")
+        if len(set(multitask_tasks)) != len(multitask_tasks):
+            raise ValueError("'foundation_multitask_tasks' must not contain duplicate task names.")
+        if len(set(multitask_tasks)) < 2:
+            raise ValueError("'foundation_multitask_tasks' must contain at least two active tasks for F15.")
+        invalid_tasks = sorted(
+            set(multitask_tasks).difference({"detect", "segment", "pose", "classify", "depth", "normal", "semantic"})
+        )
+        if invalid_tasks:
+            raise ValueError(f"'foundation_multitask_tasks' contains unsupported tasks: {invalid_tasks}.")
+    if isinstance(negative_transfer_threshold, bool) or float(negative_transfer_threshold) <= 0:
+        raise ValueError("'foundation_multitask_negative_transfer_threshold' must be a positive number.")
+    if isinstance(semantic_temperature, bool) or float(semantic_temperature) <= 0:
+        raise ValueError(f"'foundation_semantic_temperature={semantic_temperature}' is invalid. It must be positive.")
+
+    nonnegative_weights = (
+        "foundation_loss_weight",
+        "foundation_relation_weight",
+        "foundation_cosine_weight",
+        "foundation_foreground_weight",
+        "foundation_boundary_weight",
+        "foundation_background_weight",
+        "foundation_router_loss_weight",
+        "foundation_semantic_loss_weight",
+    )
+    for key in nonnegative_weights:
+        value = cfg.get(key, DEFAULT_CFG_DICT[key])
+        if value < 0:
+            raise ValueError(f"'{key}={value}' is invalid. Foundation loss weights must be >= 0.")
+
+    model = cfg.get("foundation_model")
+    weights = cfg.get("foundation_weights")
+    for key, value in (
+        ("foundation_model", model),
+        ("foundation_weights", weights),
+        ("foundation_dinov3_model", cfg.get("foundation_dinov3_model")),
+        ("foundation_siglip2_model", cfg.get("foundation_siglip2_model")),
+        ("foundation_dinov3_weights", cfg.get("foundation_dinov3_weights")),
+        ("foundation_siglip2_weights", cfg.get("foundation_siglip2_weights")),
+    ):
+        if value is not None and not isinstance(value, STR_OR_PATH):
+            raise TypeError(f"'{key}={value}' must be a string or path when provided.")
+
+    device = cfg.get("foundation_teacher_device", DEFAULT_CFG_DICT["foundation_teacher_device"])
+    if not isinstance(device, (str, int)) or isinstance(device, bool):
+        raise TypeError("'foundation_teacher_device' must be 'auto', a device string, or a non-negative integer.")
+    if isinstance(device, int) and device < 0:
+        raise ValueError("'foundation_teacher_device' integer selectors must be >= 0.")
+
+    enabled = cfg.get("foundation_enabled", DEFAULT_CFG_DICT["foundation_enabled"])
+    if not enabled:
+        return
+
+    mode = cfg.get("mode", DEFAULT_CFG_DICT["mode"])
+    if mode != "train":
+        raise ValueError("Foundation Teacher distillation is training-only; set 'mode=train' or disable it.")
+    if teacher == "none":
+        cache_dir = cfg.get("foundation_cache_dir")
+        if cache_dir in (None, "", "none"):
+            raise ValueError(
+                "'foundation_enabled=True' requires 'foundation_teacher' or 'foundation_cache_dir' pointing to a "
+                "valid offline feature cache directory."
+            )
+    if multitask_enabled:
+        if cfg.get("task", DEFAULT_CFG_DICT.get("task")) != "multitask":
+            raise ValueError("F15 foundation_multitask=True requires task='multitask'.")
+        if multitask_tasks is not None and len(set(multitask_tasks)) < 2:
+            raise ValueError("F15 requires at least two active visual tasks.")
+    if semantic_distill and teacher != "siglip2":
+        raise ValueError("F13 semantic distillation currently requires foundation_teacher='siglip2'.")
+    router_enabled = bool(cfg.get("foundation_router_distill", DEFAULT_CFG_DICT["foundation_router_distill"]))
+    if teacher == "multi":
+        if router_teachers != ("dinov3", "siglip2"):
+            raise ValueError(
+                "F14 foundation_teacher='multi' requires foundation_router_teachers=['dinov3', 'siglip2']."
+            )
+        if not router_enabled:
+            raise ValueError("F14 foundation_teacher='multi' requires foundation_router_distill=True.")
+    if cfg.get("distill_model") is not None:
+        raise ValueError("'foundation_enabled=True' cannot be combined with the existing 'distill_model' option.")
+    if cfg.get("compile"):
+        raise ValueError("'compile' is not supported with Foundation distillation in the alpha phase.")
+
+    loss_weight = cfg.get("foundation_loss_weight", DEFAULT_CFG_DICT["foundation_loss_weight"])
+    router_loss_weight = cfg.get("foundation_router_loss_weight", DEFAULT_CFG_DICT["foundation_router_loss_weight"])
+    if teacher == "multi" and router_loss_weight <= 0:
+        raise ValueError("F14 foundation_teacher='multi' requires a positive foundation_router_loss_weight.")
+    if (
+        loss_weight <= 0
+        and (not router_enabled or router_loss_weight <= 0)
+        and (not semantic_distill or semantic_loss_weight <= 0)
+    ):
+        return
+    cache_dir = cfg.get("foundation_cache_dir")
+    if teacher == "none" and cache_dir not in (None, "", "none"):
+        return
+    model_ref = model or weights
+    if teacher == "multi":
+        model_ref = model_ref or cfg.get("foundation_dinov3_model") or cfg.get("foundation_siglip2_model")
+    if model_ref is None:
+        raise ValueError(
+            "Enabled Foundation distillation with a positive loss weight requires 'foundation_model' or "
+            "'foundation_weights' (or F14 per-teacher model references)."
+        )
+    if backend == "transformers" and not _foundation_transformers_available():
+        raise ImportError(
+            "Foundation Transformers backend requires optional dependency 'transformers>=4.56.0,<6'. "
+            "Install with: pip install -e '.[foundation]'"
+        )
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
@@ -534,9 +1027,10 @@ def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:
 
     Examples:
         >>> from types import SimpleNamespace
-        >>> args = SimpleNamespace(project="my_project", name="exp", task="detect", mode="train", exist_ok=True)
-        >>> get_save_dir(args).parts[-3:]
-        ('detect', 'my_project', 'exp')
+        >>> args = SimpleNamespace(project="my_project", task="detect", mode="train", exist_ok=True)
+        >>> save_dir = get_save_dir(args)
+        >>> print(save_dir)
+        runs/detect/my_project/train
     """
     if getattr(args, "save_dir", None):
         save_dir = args.save_dir
@@ -582,14 +1076,6 @@ def _handle_deprecation(custom: dict) -> dict:
         "line_thickness": ("line_width", lambda v: v),
     }
     removed_keys = {"label_smoothing", "save_hybrid", "crop_fraction"}
-
-    if "end2end" in custom:
-        end2end = custom.pop("end2end")
-        if end2end is not None:
-            if not isinstance(end2end, bool):
-                raise TypeError("Deprecated 'end2end' must be a bool.")
-            custom["nms"] = False if end2end else True if custom.get("nms") is True else None
-            deprecation_warn(f"end2end={end2end}", f"nms={custom.get('nms')}")
 
     # Forward the deprecated precision flags onto the unified `quantize` scheme (int8 wins over half). The value is read
     # as a bool so quoted/string 'False' disables it while a bare CLI flag (empty string) enables it; an explicit false
@@ -639,7 +1125,6 @@ def check_dict_alignment(
         ...     check_dict_alignment(base_cfg, custom_cfg)
         ... except SyntaxError:
         ...     print("Mismatched keys found")
-        Mismatched keys found
 
     Notes:
         - Suggests corrections for mismatched keys based on similarity to valid keys.
@@ -650,7 +1135,7 @@ def check_dict_alignment(
     base_keys, custom_keys = (frozenset(x.keys()) for x in (base, custom))
     # Allow 'augmentations' as a valid custom parameter for custom Albumentations transforms
     if allowed_custom_keys is None:
-        allowed_custom_keys = {"augmentations", "save_dir"}
+        allowed_custom_keys = {"augmentations", "save_dir"} | LORA_RUNTIME_METADATA_KEYS
     if mismatched := [k for k in custom_keys if k not in base_keys and k not in allowed_custom_keys]:
         from difflib import get_close_matches
 
@@ -722,31 +1207,33 @@ def merge_equals_args(args: list[str]) -> list[str]:
     return new_args
 
 
-def handle_yolo_login(args: list[str]) -> None:
-    """Log in to Ultralytics Platform with an API key or remove the saved key."""
-    if args[0] == "logout":
-        SETTINGS["api_key"] = ""
-        LOGGER.info("Logged out ✅. To log in again, use 'yolo login API_KEY'.")
-        return
+def handle_yolo_hub(args: list[str]) -> None:
+    """Handle Ultralytics HUB command-line interface (CLI) commands for authentication.
 
-    api_key_url = f"{PLATFORM_URL}/settings?tab=api-keys"
-    if len(args) < 2:
-        LOGGER.info(f"Get an API key from {api_key_url} and then run 'yolo login API_KEY'.")
-        return
+    This function processes Ultralytics HUB CLI commands such as login and logout. It should be called when executing a
+    script with arguments related to HUB authentication.
 
-    from ultralytics import APIConnectionError, APIError, Platform
+    Args:
+        args (list[str]): A list of command line arguments. The first argument should be either 'login' or 'logout'. For
+            'login', an optional second argument can be the API key.
 
-    try:
-        with Platform(api_key=args[1], base_url=PLATFORM_URL, timeout=30) as client:
-            client.account.summary()
-        SETTINGS["api_key"] = args[1]
-        LOGGER.info("New authentication successful ✅")
-    except APIError as error:
-        LOGGER.warning(
-            "Invalid API key" if error.status_code == 401 else f"Authentication failed (HTTP {error.status_code})"
-        )
-    except APIConnectionError as error:
-        LOGGER.warning(f"Authentication request failed, check your connection: {error}")
+    Examples:
+        $ yolo login YOUR_API_KEY
+
+    Notes:
+        - The function imports the 'hub' module from ultralytics to perform login and logout operations.
+        - For the 'login' command, if no API key is provided, an empty string is passed to the login function.
+        - The 'logout' command does not require any additional arguments.
+    """
+    from ultralytics import hub
+
+    if args[0] == "login":
+        key = args[1] if len(args) > 1 else ""
+        # Log in to Ultralytics HUB using the provided API key
+        hub.login(key)
+    elif args[0] == "logout":
+        # Log out from Ultralytics HUB
+        hub.logout()
 
 
 def handle_yolo_settings(args: list[str]) -> None:
@@ -769,9 +1256,9 @@ def handle_yolo_settings(args: list[str]) -> None:
         - The function will check for alignment between the provided settings and the existing ones.
         - After processing, the updated settings will be displayed.
         - For more information on handling YOLO settings, visit:
-          https://docs.ultralytics.com/quickstart#ultralytics-settings
+          https://docs.ultralytics.com/quickstart/#ultralytics-settings
     """
-    url = "https://docs.ultralytics.com/quickstart#ultralytics-settings"  # help URL
+    url = "https://docs.ultralytics.com/quickstart/#ultralytics-settings"  # help URL
     try:
         if any(args):
             if args[0] == "reset":
@@ -864,8 +1351,7 @@ def handle_yolo_solutions(args: list[str]) -> None:
                 "--server.headless",
                 "true",
                 overrides.pop("model", "yolo26n.pt"),
-            ],
-            check=False,
+            ]
         )
     else:
         import cv2  # Only needed for cap and vw functionality
@@ -899,6 +1385,57 @@ def handle_yolo_solutions(args: list[str]) -> None:
                     break
         finally:
             cap.release()
+
+
+def _format_mixture_profiles(profiles: tuple) -> str:
+    """Format mixture catalog profiles as a deterministic plain-text table."""
+    headers = ("PROFILE", "TASK", "FAMILY", "KINDS", "SCALES", "MODULES")
+    rows = [
+        (
+            profile.profile_id,
+            profile.task,
+            profile.family,
+            ",".join(profile.mixture_kinds),
+            ",".join(profile.scales) or "-",
+            ",".join(profile.mixture_modules),
+        )
+        for profile in profiles
+    ]
+    widths = [max((len(headers[index]), *(len(row[index]) for row in rows))) for index in range(len(headers))]
+
+    def render(row: tuple[str, ...]) -> str:
+        """Render one left-aligned table row."""
+        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+
+    lines = [render(headers), render(tuple("-" * width for width in widths))]
+    lines.extend(render(row) for row in rows)
+    count = len(rows)
+    lines.append(f"{count} mixture profile{'s' if count != 1 else ''}")
+    return "\n".join(lines)
+
+
+def handle_yolo_mixtures(args: list[str]) -> None:
+    """List packaged mixture model profiles without constructing model instances."""
+    from ultralytics.cfg import mixture_catalog
+
+    options = {"kind": None, "task": None, "family": None, "format": "table"}
+    for argument in merge_equals_args(args):
+        if "=" not in argument:
+            raise ValueError(f"invalid mixtures argument {argument!r}; expected key=value")
+        key, value = parse_key_value_pair(argument)
+        if key not in options:
+            raise ValueError(f"unknown mixtures argument {key!r}; expected one of {tuple(options)}")
+        options[key] = value
+
+    output_format = str(options.pop("format")).casefold()
+    if output_format not in {"table", "json"}:
+        raise ValueError(f"unknown mixtures format {output_format!r}; expected 'table' or 'json'")
+    filters = {key: str(value) for key, value in options.items() if value is not None}
+    profiles = mixture_catalog.list_mixture_profiles(**filters)
+    if output_format == "json":
+        LOGGER.info(json.dumps([profile.as_dict() for profile in profiles], indent=2, sort_keys=False))
+    else:
+        LOGGER.info(_format_mixture_profiles(profiles))
 
 
 def parse_key_value_pair(pair: str = "key=value") -> tuple:
@@ -954,7 +1491,7 @@ def smart_value(v: str) -> Any:
         3.14
         >>> smart_value("True")
         True
-        >>> print(smart_value("None"))
+        >>> smart_value("None")
         None
         >>> smart_value("some_string")
         'some_string'
@@ -1016,12 +1553,14 @@ def entrypoint(debug: str = "") -> None:
         "checks": checks.collect_system_info,
         "version": lambda: LOGGER.info(__version__),
         "settings": lambda: handle_yolo_settings(args[1:]),
+        "mixtures": lambda: handle_yolo_mixtures(args[1:]),
         "cfg": lambda: YAML.print(DEFAULT_CFG_PATH),
-        "login": lambda: handle_yolo_login(args),
-        "logout": lambda: handle_yolo_login(args),
+        "hub": lambda: handle_yolo_hub(args[1:]),
+        "login": lambda: handle_yolo_hub(args),
+        "logout": lambda: handle_yolo_hub(args),
         "copy-cfg": copy_default_cfg,
         "solutions": lambda: handle_yolo_solutions(args[1:]),
-        "help": lambda: LOGGER.info(CLI_HELP_MSG),
+        "help": lambda: LOGGER.info(CLI_HELP_MSG),  # help below hub for -h flag precedence
     }
     full_args_dict = {**DEFAULT_CFG_DICT, **{k: None for k in TASKS}, **{k: None for k in MODES}, **special}
 
@@ -1058,8 +1597,8 @@ def entrypoint(debug: str = "") -> None:
             return
         elif a in DEFAULT_CFG_DICT and isinstance(DEFAULT_CFG_DICT[a], bool):
             overrides[a] = True  # auto-True for default bool args, i.e. 'yolo show' sets show=True
-        elif a in {"half", "int8", "end2end", "nms"}:
-            overrides[a] = True  # bare boolean flags whose defaults are missing or None
+        elif a in {"half", "int8"}:
+            overrides[a] = True  # deprecated bare precision flags, forwarded to quantize by _handle_deprecation
         elif a in DEFAULT_CFG_DICT:
             raise SyntaxError(
                 f"'{colorstr('red', 'bold', a)}' is a valid YOLO argument but is missing an '=' sign "
@@ -1117,9 +1656,9 @@ def entrypoint(debug: str = "") -> None:
 
         model = YOLO(model, task=task)
         if "yoloe" in stem or "world" in stem:
-            cls_list = overrides.get("classes", DEFAULT_CFG.classes)
-            if isinstance(cls_list, str):  # text prompts, i.e. "person, bus" -> ['person', 'bus']
-                model.set_classes([c.strip() for c in overrides.pop("classes", cls_list).split(",")])
+            cls_list = overrides.pop("classes", DEFAULT_CFG.classes)
+            if cls_list is not None and isinstance(cls_list, str):
+                model.set_classes([c.strip() for c in cls_list.split(",")])  # "person, bus" -> ['person', 'bus']
     # Task Update
     if task != model.task:
         if task:
@@ -1165,6 +1704,9 @@ def copy_default_cfg() -> None:
 
     Examples:
         >>> copy_default_cfg()
+        # Output: default.yaml copied to /path/to/current/directory/default_copy.yaml
+        # Example YOLO command with this new custom cfg:
+        #   yolo cfg='/path/to/current/directory/default_copy.yaml' imgsz=320 batch=8
 
     Notes:
         - The new configuration file is created in the current working directory.

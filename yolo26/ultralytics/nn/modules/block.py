@@ -3,11 +3,9 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -55,6 +53,11 @@ __all__ = (
     "SCDown",
     "TorchVision",
 )
+
+# Defined separately to keep the upstream block implementation intact while preserving historical pickle paths.
+from .dynamic_moe import DyC2f, DyMoEBlock, DynamicExpert, MoEGate
+
+__all__ += ("DynamicExpert", "MoEGate", "DyMoEBlock", "DyC2f")
 
 
 class DFL(nn.Module):
@@ -155,7 +158,7 @@ class HGBlock(nn.Module):
         n: int = 6,
         lightconv: bool = False,
         shortcut: bool = False,
-        act: nn.Module | None = None,
+        act: nn.Module = nn.ReLU(),
     ):
         """Initialize HGBlock with specified parameters.
 
@@ -170,7 +173,6 @@ class HGBlock(nn.Module):
             act (nn.Module): Activation function.
         """
         super().__init__()
-        act = nn.ReLU() if act is None else act
         block = LightConv if lightconv else Conv
         self.m = nn.ModuleList(block(c1 if i == 0 else cm, cm, k=k, act=act) for i in range(n))
         self.sc = Conv(c1 + n * cm, c2 // 2, 1, 1, act=act)  # squeeze conv
@@ -1289,8 +1291,6 @@ class Attention(nn.Module):
         pe (Conv): Convolutional layer for positional encoding.
     """
 
-    format = None
-
     def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
         """Initialize multi-head attention module.
 
@@ -1326,12 +1326,9 @@ class Attention(nn.Module):
             [self.key_dim, self.key_dim, self.head_dim], dim=2
         )
 
-        if self.format == "coreml" and hasattr(F, "scaled_dot_product_attention"):
-            x = F.scaled_dot_product_attention(q.transpose(-2, -1), k.transpose(-2, -1), v.transpose(-2, -1))
-            x = x.transpose(-2, -1).reshape(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        else:
-            attn = ((q * self.scale).transpose(-2, -1) @ k).softmax(dim=-1)
-            x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        attn = (q * self.scale).transpose(-2, -1) @ k
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
         x = self.proj(x)
         return x
 
@@ -1480,7 +1477,7 @@ class C2PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
+        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process the input tensor through a series of PSA blocks.
@@ -2007,8 +2004,7 @@ class Proto26(Proto):
         feat = x[0]
         for i, f in enumerate(self.feat_refine):
             up_feat = f(x[i + 1])
-            # Constant scale (P4/P5 -> P3) keeps the upsample static for dynamic-shape CoreML export
-            up_feat = F.interpolate(up_feat, scale_factor=2 ** (i + 1), mode="nearest")
+            up_feat = F.interpolate(up_feat, size=feat.shape[2:], mode="nearest")
             feat = feat + up_feat
         p = super().forward(self.feat_fuse(feat))
         if self.training and return_semantic:
@@ -2039,11 +2035,14 @@ class RealNVP(nn.Module):
         """Get the translation model in a single invertible mapping."""
         return nn.Sequential(nn.Linear(2, 64), nn.SiLU(), nn.Linear(64, 64), nn.SiLU(), nn.Linear(64, 2))
 
+    @property
+    def prior(self):
+        """The prior distribution."""
+        return torch.distributions.MultivariateNormal(self.loc, self.cov)
+
     def __init__(self):
         super().__init__()
 
-        # loc/cov are no longer read (the prior is the closed-form standard normal in log_prob) but stay registered so
-        # checkpoints saved before 8.4.126 still resume: the EMA state is loaded strictly.
         self.register_buffer("loc", torch.zeros(2))
         self.register_buffer("cov", torch.eye(2))
         self.register_buffer("mask", torch.tensor([[0, 1], [1, 0]] * 3, dtype=torch.float32))
@@ -2076,71 +2075,4 @@ class RealNVP(nn.Module):
         if x.dtype == torch.float32 and self.s[0][0].weight.dtype != torch.float32:
             self.float()
         z, log_det = self.backward_p(x)
-        # Closed-form log N(z; 0, I) in 2-D; fp32 keeps z**2 from overflowing under AMP.
-        return -0.5 * (z.float() ** 2).sum(-1) - math.log(2 * math.pi) + log_det
-
-####### 2026 tri-modal ##########
-class CIFusion3(nn.Module):
-    """Tri-modal channel-switching fusion. 输入cat([rgb,ir,dep])共3*c1通道, 输出3*c1, 前向chunk回三路."""
-
-    def __init__(self, c1, r=16, dimension=1):
-        super().__init__()
-        self.c1 = c1
-        self.c_total = c1 * 3
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(self.c_total, self.c_total // r, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.c_total // r, self.c_total, bias=False),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x):
-        b = x.size(0)
-        y = self.fc(self.avg_pool(x).view(b, self.c_total)).view(b, self.c_total, 1, 1)
-        x1 = x * y
-        return x + torch.cat((x1[:, 2 * self.c1:, ...], x1[:, :2 * self.c1, ...]), dim=1)
-
-
-class ADD3(nn.Module):
-    """三个特征图逐元素相加."""
-
-    def __init__(self, arg):
-        super(ADD3, self).__init__()
-
-    def forward(self, x):
-        return x[0] + x[1] + x[2]
-
-
-####### 2026 ACFI ##########
-class ACFI(nn.Module):
-    """ACFI 跨层信息交互 (复现 ACFI-YOLO11). 以中层为中心, 浅层下采样/深层上采样对齐,
-    LFA通道聚合向量作为token过Transformer编码器, 哈达玛加权+残差, 拼接1x1融合."""
-
-    def __init__(self, c_shallow, c_mid, c_deep):
-        super().__init__()
-        self.c_mid = c_mid
-        self.down = Conv(c_shallow, c_mid, 3, 2)
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
-        self.align_deep = Conv(c_deep, c_mid, 1, 1)
-        hidden = max(16, c_mid // 8)
-        self.mlp = nn.Sequential(nn.Linear(c_mid, hidden, bias=False), nn.Linear(hidden, c_mid, bias=False))
-        layer = nn.TransformerEncoderLayer(d_model=c_mid, nhead=8, dim_feedforward=c_mid * 2,
-                                           dropout=0.1, activation='relu', batch_first=True)
-        self.encoder = nn.TransformerEncoder(layer, num_layers=1)
-        self.fuse = Conv(c_mid * 3, c_mid, 1, 1)
-
-    def lfa(self, x):
-        m = self.mlp(F.adaptive_max_pool2d(x, 1).flatten(1))
-        a = self.mlp(F.adaptive_avg_pool2d(x, 1).flatten(1))
-        return F.silu(m + a)
-
-    def forward(self, x):
-        xs, xm, xd = x
-        xs = self.down(xs)
-        xd = self.align_deep(self.up(xd))
-        ms = torch.stack([self.lfa(xs), self.lfa(xm), self.lfa(xd)], dim=1)
-        m = self.encoder(ms)
-        def apply(w, f):
-            return w.unsqueeze(-1).unsqueeze(-1) * f + f
-        return self.fuse(torch.cat([apply(m[:, 0], xs), apply(m[:, 1], xm), apply(m[:, 2], xd)], dim=1))
+        return self.prior.log_prob(z) + log_det

@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn as nn
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.engine.trainer import BaseTrainer
@@ -30,7 +30,7 @@ class DetectionTrainer(BaseTrainer):
     Attributes:
         model (DetectionModel): The YOLO detection model being trained.
         data (dict): Dictionary containing dataset information including class names and number of classes.
-        loss_names (tuple): Names of the loss components, derived from the loss dict returned by the criterion.
+        loss_names (tuple): Names of the loss components used in training (box_loss, cls_loss, dfl_loss).
 
     Methods:
         build_dataset: Build YOLO dataset for training or validation.
@@ -39,6 +39,7 @@ class DetectionTrainer(BaseTrainer):
         set_model_attributes: Set model attributes based on dataset information.
         get_model: Return a YOLO detection model.
         get_validator: Return a validator for model evaluation.
+        label_loss_items: Return a loss dictionary with labeled training loss items.
         progress_string: Return a formatted string of training progress.
         plot_training_samples: Plot training samples with their annotations.
         plot_training_labels: Create a labeled training plot of the YOLO model.
@@ -101,7 +102,6 @@ class DetectionTrainer(BaseTrainer):
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",
-            device=self.device,
         )
 
     def preprocess_batch(self, batch: dict) -> dict:
@@ -115,7 +115,7 @@ class DetectionTrainer(BaseTrainer):
         """
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
-                batch[k] = v.to(self.device, non_blocking=self.device.type not in {"cpu", "mps"})
+                batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
         batch["img"] = batch["img"].float() / 255
         if self.args.multi_scale > 0.0:
             imgs = batch["img"]
@@ -145,6 +145,8 @@ class DetectionTrainer(BaseTrainer):
         self.model.nc = self.data["nc"]  # attach number of classes to model
         self.model.names = self.data["names"]  # attach class names to model
         self.model.args = self.args  # attach hyperparameters to model
+        if getattr(self.model, "end2end", False):
+            self.model.set_head_attr(max_det=self.args.max_det)
 
     def set_model_names_for_load(self, model):
         """Set target dataset names before loading weights so cls heads can remap by name."""
@@ -177,9 +179,9 @@ class DetectionTrainer(BaseTrainer):
             return
         weights = self.compute_class_weights(class_counts)
         weights = weights / weights.mean()  # normalize so mean equals 1.0
-        model = unwrap_model(self.model)
-        if hasattr(model, "student_model"):
-            model = model.student_model  # distillation: the student model builds the loss criterion
+        model = self.model
+        if hasattr(unwrap_model(model), "student_model"):
+            model = unwrap_model(model).student_model  # distillation: the student model builds the loss criterion
         model.class_weights = torch.from_numpy(weights).to(self.device)
         LOGGER.info(f"Class weights: {model.class_weights.cpu().numpy().round(3)}")
 
@@ -203,17 +205,27 @@ class DetectionTrainer(BaseTrainer):
 
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         return yolo.detect.DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
 
-    def _build_train_pipeline(self):
-        """Build the training pipeline and align the default detection limit with observed dataset object counts."""
-        super()._build_train_pipeline()
-        if self.args.task in {"detect", "segment", "pose", "obb"}:
-            datasets = {"train": self.train_loader.dataset, "val": self.test_loader.dataset}
-            yolo.detect.DetectionValidator._check_max_det(self.args, datasets)
-            unwrap_model(self.model).set_head_attr(max_det=self.args.max_det)
+    def label_loss_items(self, loss_items: list[float] | None = None, prefix: str = "train"):
+        """Return a loss dict with labeled training loss items tensor.
+
+        Args:
+            loss_items (list[float], optional): List of loss values.
+            prefix (str): Prefix for keys in the returned dictionary.
+
+        Returns:
+            (dict | list): Dictionary of labeled loss items if loss_items is provided, otherwise list of keys.
+        """
+        keys = [f"{prefix}/{x}" for x in self.loss_names]
+        if loss_items is not None:
+            loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
+            return dict(zip(keys, loss_items))
+        else:
+            return keys
 
     def progress_string(self):
         """Return a formatted string of training progress with epoch, GPU memory, loss, instances and size."""

@@ -15,21 +15,22 @@ def onnx_calibration_reader(dataset, transform_fn, input_name: str = "images", b
 
     class _CalibrationReader(CalibrationDataReader):
         def __init__(self):
-            """Initialize calibration dataset iteration."""
-            self.iterator = iter(dataset)
+            """Materialize calibration inputs as `{input_name: float32_NCHW}` dicts."""
+            self.samples = []
+            for b in dataset:
+                im = transform_fn(b)
+                if batch and im.shape[0] != batch:  # tile up to the static batch dimension
+                    im = np.tile(im, (-(-batch // im.shape[0]), 1, 1, 1))[:batch]
+                self.samples.append({input_name: im})
+            self.iterator = iter(self.samples)
 
         def get_next(self):
             """Return the next calibration sample, or None when exhausted."""
-            if (b := next(self.iterator, None)) is None:
-                return None
-            im = transform_fn(b)
-            if batch and im.shape[0] != batch:  # tile up to the static batch dimension
-                im = np.tile(im, (-(-batch // im.shape[0]), 1, 1, 1))[:batch]
-            return {input_name: im}
+            return next(self.iterator, None)
 
         def rewind(self):
             """Reset the iterator for an additional calibration pass."""
-            self.iterator = iter(dataset)
+            self.iterator = iter(self.samples)
 
     return _CalibrationReader()
 
@@ -52,7 +53,6 @@ def onnx_int8_quantize(
     # ONNX Runtime crash on the uncalibrated attention Softmax.
     graph = onnx.load(onnx_file).graph
     exclude = [n.name for n in graph.node if n.op_type not in {"Conv", "Gemm", "MatMul"}]
-    del graph
 
     LOGGER.info(f"{prefix} quantizing INT8 with ONNX Runtime...")
     quantize_static(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ from torch.nn import functional as F
 
 from ultralytics.data import YOLOConcatDataset, build_dataloader, build_yolo_dataset
 from ultralytics.data.augment import LoadVisualPrompt
-from ultralytics.data.utils import check_det_dataset, get_split_fraction
+from ultralytics.data.utils import check_det_dataset
 from ultralytics.models.yolo.detect import DetectionValidator
 from ultralytics.models.yolo.segment import SegmentationValidator
 from ultralytics.nn.modules.head import YOLOEDetect
@@ -35,7 +36,7 @@ class YOLOEDetectValidator(DetectionValidator):
         get_visual_pe: Extract visual prompt embeddings from training samples.
         preprocess: Preprocess batch data ensuring visuals are on the same device as images.
         get_vpe_dataloader: Create a dataloader for LVIS training visual prompt samples.
-        get_model: Prepare a validation model with text or visual prompt embeddings.
+        __call__: Run validation using either text or visual prompt embeddings.
 
     Examples:
         Validate with text prompts
@@ -114,7 +115,6 @@ class YOLOEDetectValidator(DetectionValidator):
             data,
             mode="val",
             rect=False,
-            fraction=get_split_fraction(self.args.fraction, self.args.split or "val"),
         )
         if isinstance(dataset, YOLOConcatDataset):
             for d in dataset.datasets:
@@ -127,18 +127,21 @@ class YOLOEDetectValidator(DetectionValidator):
             self.args.workers,
             shuffle=False,
             rank=-1,
-            device=self.device,
         )
 
-    @smart_inference_mode(False)
-    def get_model(
+    @smart_inference_mode()
+    def __call__(
         self,
-        model: YOLOEModel | str | None = None,
         trainer: Any | None = None,
+        model: YOLOEModel | str | None = None,
         refer_data: str | None = None,
         load_vp: bool = False,
-    ) -> YOLOEModel:
-        """Prepare text, visual, or prompt-free models before validation inference setup.
+    ) -> dict[str, Any]:
+        """Run validation on the model using either text or visual prompt embeddings.
+
+        This method validates the model using either text prompts or visual prompts, depending on the load_vp flag. It
+        supports validation during training (using a trainer object) or standalone validation with a provided model. For
+        visual prompts, reference data can be specified to extract embeddings from a different dataset.
 
         Args:
             trainer (object, optional): Trainer object containing the model and device.
@@ -147,11 +150,11 @@ class YOLOEDetectValidator(DetectionValidator):
             load_vp (bool): Whether to load visual prompts. If False, text prompts are used.
 
         Returns:
-            (YOLOEModel): Model with prompts prepared for validation.
+            (dict): Validation statistics containing metrics computed during validation.
         """
-        model = super().get_model(model, trainer)
         if trainer is not None:
             self.device = trainer.device
+            model = trainer.ema.ema
             names = [name.split("/", 1)[0] for name in list(self.dataloader.dataset.data["names"].values())]
 
             if load_vp:
@@ -164,6 +167,7 @@ class YOLOEDetectValidator(DetectionValidator):
                 LOGGER.info("Validate using the text prompt.")
                 tpe = model.get_text_pe(names)
                 model.set_classes(names, tpe)
+            stats = super().__call__(trainer, model)
         else:
             if refer_data is not None:
                 assert load_vp, "Refer data is only used for visual prompt validation."
@@ -192,12 +196,18 @@ class YOLOEDetectValidator(DetectionValidator):
                 dataloader = self.get_vpe_dataloader(data)
                 vpe = self.get_visual_pe(dataloader, model)
                 model.set_classes(names, vpe)
-            elif not (isinstance(model.model[-1], YOLOEDetect) and hasattr(model.model[-1], "lrpc")):  # text prompts
+                stats = super().__call__(model=deepcopy(model))
+            elif isinstance(model.model[-1], YOLOEDetect) and hasattr(model.model[-1], "lrpc"):  # prompt-free
+                return super().__call__(trainer, model)
+            else:
                 LOGGER.info("Validate using the text prompt.")
                 tpe = model.get_text_pe(names)
                 model.set_classes(names, tpe)
-        return model
+                stats = super().__call__(model=deepcopy(model))
+        return stats
 
 
 class YOLOESegValidator(YOLOEDetectValidator, SegmentationValidator):
     """YOLOE segmentation validator that supports both text and visual prompt embeddings."""
+
+    pass

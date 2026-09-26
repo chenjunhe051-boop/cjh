@@ -4,7 +4,9 @@ from ultralytics.utils import SETTINGS
 
 try:
     assert SETTINGS["raytune"] is True  # verify integration is enabled
+    import ray
     from ray import tune
+    from ray.air import session
 
 except (ImportError, AssertionError):
     tune = None
@@ -26,10 +28,9 @@ def on_fit_epoch_end(trainer):
     References:
         Ray Tune docs: https://docs.ray.io/en/latest/tune/index.html
     """
-    trial_id = tune.get_context().get_trial_id() if hasattr(tune, "get_context") else tune.get_trial_id()
-    if trial_id:  # check if Ray Tune session is active
+    if ray.train._internal.session.get_session():  # check if Ray Tune session is active
         metrics = trainer.metrics
-        tune.report({**metrics, "epoch": trainer.epoch + 1})
+        session.report({**metrics, **{"epoch": trainer.epoch + 1}})
 
 
 callbacks = (

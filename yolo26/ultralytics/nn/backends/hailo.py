@@ -33,7 +33,7 @@ class HailoBackend(BaseBackend):
         except ImportError as e:
             raise ImportError(
                 "Hailo inference requires HailoRT. "
-                "See https://docs.ultralytics.com/integrations/hailo#run-hailo-inference"
+                "See https://docs.ultralytics.com/integrations/hailo/#run-hailo-inference"
             ) from e
 
         w = Path(weight)
@@ -42,11 +42,14 @@ class HailoBackend(BaseBackend):
             raise FileNotFoundError(f"No .hef file found in: {w}")
 
         LOGGER.info(f"Loading {hef_file} for Hailo inference...")
-        self.apply_metadata(self.read_metadata(hef_file))
-        if self.task and self.task not in {"detect", "segment", "pose", "obb", "classify", "semantic", "depth"}:
+        metadata_file = hef_file.parent / "metadata.yaml"
+        if metadata_file.exists():
+            from ultralytics.utils import YAML
+
+            self.apply_metadata(YAML.load(metadata_file))
+        if self.task and self.task not in {"detect", "segment", "pose", "obb", "classify"}:
             raise ValueError(
-                f"Hailo inference only supports detect, segment, pose, obb, classify, semantic and depth tasks, "
-                f"not task='{self.task}'."
+                f"Hailo inference only supports detect, segment, pose, obb and classify tasks, not task='{self.task}'."
             )
 
         self.hef = HEF(str(hef_file))
@@ -66,7 +69,8 @@ class HailoBackend(BaseBackend):
             from ultralytics.nn.modules import DFL
 
             self._dfl = DFL()
-        self.end2end = self.end2end or self.metadata.get("nms", False)  # head selection or HailoRT NMS
+        # segmentation, pose and OBB return a dense tensor for the predictor's NMS; detect and classify do not
+        self.end2end = self.task not in {"segment", "pose", "obb"}
 
     def __del__(self):
         """Release the Hailo pipeline and device."""
@@ -86,16 +90,6 @@ class HailoBackend(BaseBackend):
             return self._decode_obb(outputs)
         if self.task == "classify":
             return torch.from_numpy(outputs[0]).reshape(outputs[0].shape[0], -1)  # on-chip softmax probabilities
-        if self.task == "semantic":
-            out = torch.from_numpy(outputs[0])
-            if self.metadata.get("semantic_baked"):
-                # Multi-class Hailo-10/15 baked the upsample and argmax on chip; return the class map.
-                return out.reshape(out.shape[0], out.shape[1], out.shape[2])
-            # Hailo-8/8L and single-class heads return raw stride-8 logits; hand them to the predictor's existing
-            # bilinear upsample, letterbox removal, and class reduction so results match the PyTorch model exactly.
-            return out.permute(0, 3, 1, 2)
-        if self.task == "depth":
-            return self._decode_depth(outputs[0])
         return self._decode_raw(outputs) if not self.metadata.get("nms", False) else self._decode_nms(outputs[0])
 
     def _decode_nms(self, output: list) -> np.ndarray:
@@ -182,25 +176,12 @@ class HailoBackend(BaseBackend):
             self._anchors = make_anchors(box_maps, strides)
         anchors, stride_tensor = self._anchors
         boxes = torch.cat([x.flatten(2) for x in box_maps], 2).transpose(1, 2)
-        boxes = dist2bbox(boxes, anchors, xywh=not self.end2end) * stride_tensor
+        boxes = dist2bbox(boxes, anchors, xywh=False) * stride_tensor
         scores = torch.cat([x.flatten(2) for x in cls_maps], 2).transpose(1, 2).sigmoid()
-        if not self.end2end:
-            return torch.cat((boxes, scores), 2).transpose(1, 2).numpy()
         classes = scores.shape[2]
         anchor_index = scores.amax(-1).topk(min(300, scores.shape[1]), dim=1).indices[..., None]
-        boxes = boxes.gather(1, anchor_index.expand(-1, -1, 4))
-        scores = scores.gather(1, anchor_index.expand(-1, -1, classes))
+        boxes = boxes.gather(1, anchor_index.repeat(1, 1, 4))
+        scores = scores.gather(1, anchor_index.repeat(1, 1, classes))
         scores, index = scores.flatten(1).topk(min(300, scores.shape[1] * classes), dim=1)
-        boxes = boxes.gather(1, (index // classes)[..., None].expand(-1, -1, 4))
+        boxes = boxes.gather(1, (index // classes)[..., None].repeat(1, 1, 4))
         return torch.cat((boxes, scores[..., None], (index % classes)[..., None].float()), 2).numpy()
-
-    def _decode_depth(self, output: np.ndarray) -> torch.Tensor:
-        """Decode the raw depth logit into a metric depth map, mirroring ``Depth.forward`` on the host.
-
-        The HEF is cut at the head's final logit conv, so the clamp/exp and learned log-affine calibration that
-        follow it in the head run here. The map stays at head resolution (H/4, W/4); ``DepthPredictor.postprocess``
-        resizes it to the image with ``scale_masks``, the same path the PyTorch model takes at inference.
-        """
-        logit = torch.from_numpy(output).permute(0, 3, 1, 2)  # (B, H/4, W/4, 1) -> (B, 1, H/4, W/4)
-        depth = logit.clamp(-4.0, 5.0).exp()
-        return depth.pow(self.metadata.get("cal_a", 1.0)) * math.exp(self.metadata.get("cal_b", 0.0))

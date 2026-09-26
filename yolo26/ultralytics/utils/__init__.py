@@ -27,8 +27,7 @@ import torch
 
 from ultralytics import __version__
 from ultralytics.utils.git import GitRepo
-from ultralytics.utils.patches import imread as imread  # re-export for backwards compatibility
-from ultralytics.utils.patches import imread_unicode, imshow, imwrite, torch_save  # for patches
+from ultralytics.utils.patches import imread, imshow, imwrite, torch_save  # for patches
 from ultralytics.utils.tqdm import TQDM  # noqa
 
 
@@ -53,10 +52,9 @@ def env_bool(name: str, default: bool = False) -> bool:
     return default if v is None else v.strip().lower() in {"1", "true", "yes", "on", "y", "t"}
 
 
-# PyTorch Multi-GPU DDP Constants, trusted only in real DDP workers, i.e. WORLD_SIZE > 1 (#16446)
-WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
-RANK = int(os.getenv("RANK", "-1")) if WORLD_SIZE > 1 else -1
-LOCAL_RANK = int(os.getenv("LOCAL_RANK", "-1")) if WORLD_SIZE > 1 else -1
+# PyTorch Multi-GPU DDP Constants
+RANK = int(os.getenv("RANK", -1))
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
 
 # Other Constants
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []
@@ -66,7 +64,6 @@ ASSETS = ROOT / "assets"  # default images
 ASSETS_URL = "https://github.com/ultralytics/assets/releases/download/v0.0.0"  # assets GitHub URL
 # Configurable Platform URL for debugging (e.g. ULTRALYTICS_PLATFORM_URL=http://localhost:3000)
 PLATFORM_URL = os.getenv("ULTRALYTICS_PLATFORM_URL", "https://platform.ultralytics.com").rstrip("/")
-PLATFORM_API_URL = os.getenv("PLATFORM_API_URL", f"{PLATFORM_URL}/api/webhooks")
 DEFAULT_CFG_PATH = ROOT / "cfg/default.yaml"
 NUM_THREADS = min(8, max(1, os.cpu_count() - 1))  # number of YOLO multiprocessing threads
 AUTOINSTALL = env_bool("YOLO_AUTOINSTALL", True)  # global auto-install mode
@@ -80,7 +77,7 @@ ARM64 = platform.machine() in {"arm64", "aarch64"}  # ARM64 booleans
 PYTHON_VERSION = platform.python_version()
 TORCH_VERSION = str(torch.__version__)  # Normalize torch.__version__ (PyTorch>1.9 returns TorchVersion objects)
 TORCHVISION_VERSION = importlib.metadata.version("torchvision")  # faster than importing torchvision
-IS_VSCODE = os.environ.get("TERM_PROGRAM") == "vscode"
+IS_VSCODE = os.environ.get("TERM_PROGRAM", False) == "vscode"
 RKNN_CHIPS = frozenset(
     {
         "rk3588",
@@ -96,16 +93,16 @@ RKNN_CHIPS = frozenset(
         "rv1126b",
     }
 )  # Rockchip processors available for export
-QNN_HTP_TARGETS = {
-    "68": ("htp_arch", "68"),  # Snapdragon 888
-    "69": ("htp_arch", "69"),  # Snapdragon 8 Gen 1
-    "73": ("htp_arch", "73"),  # Snapdragon 8 Gen 2 / X Elite
-    "75": ("htp_arch", "75"),  # Snapdragon 8 Gen 3
-    "79": ("soc_model", "69"),  # Snapdragon 8 Elite (SM8750)
-    "81": ("htp_arch", "81"),  # Snapdragon 8 Elite Gen 5
-    "iq-8275": ("soc_model", "82"),  # Dragonwing IQ-8275
-    "qcs8275": ("soc_model", "82"),
-}  # Qualcomm Hexagon HTP targets and their ONNX Runtime QNN provider option
+QNN_HTP_ARCHS = frozenset(
+    {
+        "68",  # Snapdragon 888
+        "69",  # Snapdragon 8 Gen 1
+        "73",  # Snapdragon 8 Gen 2 / X Elite
+        "75",  # Snapdragon 8 Gen 3
+        "79",  # Snapdragon 8 Elite
+        "81",  # Snapdragon 8 Elite Gen 5
+    }
+)  # Qualcomm Hexagon HTP architecture versions available for QNN export
 HELP_MSG = """
     Examples for running Ultralytics:
 
@@ -133,7 +130,7 @@ HELP_MSG = """
 
             yolo TASK MODE ARGS
 
-            Where   TASK (optional) is one of [detect, segment, semantic, classify, pose, obb, depth]
+            Where   TASK (optional) is one of [detect, segment, semantic, classify, pose, obb]
                     MODE (required) is one of [train, val, predict, export, track, benchmark]
                     ARGS (optional) are any number of custom "arg=value" pairs like "imgsz=320" that override defaults.
                         See all ARGS at https://docs.ultralytics.com/usage/cfg or with "yolo cfg"
@@ -165,7 +162,7 @@ HELP_MSG = """
 
 # Settings and Environment Variables
 torch.set_printoptions(linewidth=320, precision=4, profile="default")
-np.set_printoptions(linewidth=320, formatter={"float_kind": "{:11.5g}".format})  # format short g, %precision=5
+np.set_printoptions(linewidth=320, formatter=dict(float_kind="{:11.5g}".format))  # format short g, %precision=5
 cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
 os.environ["NUMEXPR_MAX_THREADS"] = str(NUM_THREADS)  # NumExpr max threads
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # suppress verbose TF compiler warnings in Colab
@@ -282,7 +279,11 @@ class SimpleClass:
         ...         self.x = 10
         ...         self.y = "hello"
         >>> obj = MyClass()
-        >>> text = str(obj)  # "<module>.MyClass object with attributes:" followed by "x: 10" and "y: 'hello'"
+        >>> print(obj)
+        __main__.MyClass object with attributes:
+
+        x: 10
+        y: 'hello'
 
     Notes:
         - This class is designed to be subclassed. It provides a convenient way to inspect object attributes.
@@ -403,7 +404,13 @@ def plt_settings(rcparams=None, backend="Agg"):
 
         def wrapper(*args, **kwargs):
             """Set rc parameters and backend, call the original function, and restore the settings."""
-            import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
+            try:
+                import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
+            except Exception as exc:
+                raise ImportError(
+                    "Matplotlib is required for plotting but could not be imported. "
+                    "Install a Matplotlib build compatible with the active NumPy version."
+                ) from exc
 
             # Prepend Arial Unicode for non-Latin text (CJK, Arabic, etc.); matplotlib falls back if missing
             if "font.sans-serif" not in rcparams and not wrapper._fonts_registered:
@@ -424,12 +431,6 @@ def plt_settings(rcparams=None, backend="Agg"):
             original_backend = plt.get_backend()
             switch = backend.lower() != original_backend.lower()
             if switch:
-                # Resolve configured backends first, as get_backend() may return an unavailable backend name
-                if plt._backend_mod is None:
-                    try:
-                        plt.switch_backend(original_backend)
-                    except ImportError:
-                        original_backend = None
                 plt.close("all")  # auto-close()ing of figures upon backend switching is deprecated since 3.8
                 plt.switch_backend(backend)
 
@@ -440,8 +441,7 @@ def plt_settings(rcparams=None, backend="Agg"):
             finally:
                 if switch:
                     plt.close("all")
-                    if original_backend:
-                        plt.switch_backend(original_backend)
+                    plt.switch_backend(original_backend)
             return result
 
         wrapper._fonts_registered = False
@@ -508,14 +508,11 @@ def set_logging(name="LOGGING_NAME", verbose=True):
 
     # Create and configure the StreamHandler with the appropriate formatter and level
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.set_name("ultralytics.utils.set_logging")
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(level)
 
     # Set up the logger
     logger = logging.getLogger(name)
-    for h in [h for h in logger.handlers if h.name == stream_handler.name]:
-        logger.removeHandler(h)
     logger.setLevel(level)
     logger.addHandler(stream_handler)
     logger.propagate = False
@@ -735,7 +732,7 @@ def is_ubuntu() -> bool:
         return False
 
 
-def is_debian(codenames: list[str] | str | None = None) -> list[bool] | bool:
+def is_debian(codenames: list[str] | None | str = None) -> list[bool] | bool:
     """Check if the OS is Debian.
 
     Args:
@@ -835,7 +832,7 @@ def is_jetson(jetpack=None) -> bool:
     jetson = "tegra" in DEVICE_MODEL
     if jetson and jetpack:
         try:
-            content = Path("/etc/nv_tegra_release").read_text()
+            content = open("/etc/nv_tegra_release").read()
             version_map = {4: "R32", 5: "R35", 6: "R36", 7: "R38"}  # JetPack to L4T major version mapping
             return jetpack in version_map and version_map[jetpack] in content
         except Exception:
@@ -1027,7 +1024,7 @@ def colorstr(*input):
 
     Examples:
         >>> colorstr("blue", "bold", "hello world")
-        '\x1b[34m\x1b[1mhello world\x1b[0m'
+        "\033[34m\033[1mhello world\033[0m"
 
     Notes:
         Supported Colors and Styles:
@@ -1075,7 +1072,7 @@ def remove_colorstr(input_string):
 
     Examples:
         >>> remove_colorstr(colorstr("blue", "bold", "hello world"))
-        'hello world'
+        "hello world"
     """
     ansi_escape = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
     return ansi_escape.sub("", input_string)
@@ -1111,6 +1108,7 @@ class TryExcept(contextlib.ContextDecorator):
 
     def __enter__(self):
         """Execute when entering TryExcept context, initialize instance."""
+        pass
 
     def __exit__(self, exc_type, value, traceback):
         """Define behavior when exiting a 'with' block, print error message if necessary."""
@@ -1138,11 +1136,10 @@ class Retry(contextlib.ContextDecorator):
         ...     return True
     """
 
-    def __init__(self, times=3, delay=2, verbose=True):
+    def __init__(self, times=3, delay=2):
         """Initialize Retry class with specified number of retries and delay."""
         self.times = times
         self.delay = delay
-        self.verbose = verbose  # False when the caller's own logging would feed back into its retries
         self._attempts = 0
 
     def __call__(self, func):
@@ -1156,10 +1153,9 @@ class Retry(contextlib.ContextDecorator):
                     return func(*args, **kwargs)
                 except Exception as e:
                     self._attempts += 1
-                    if self.verbose:
-                        LOGGER.warning(f"Retry {self._attempts}/{self.times} failed: {e}")
+                    LOGGER.warning(f"Retry {self._attempts}/{self.times} failed: {e}")
                     if self._attempts >= self.times:
-                        raise
+                        raise e
                     time.sleep(self.delay * (2**self._attempts))  # exponential backoff delay
 
         return wrapped_func
@@ -1176,8 +1172,7 @@ def threaded(func):
         func (callable): The function to be potentially executed in a separate thread.
 
     Returns:
-        (callable): A wrapper function that either returns a thread or the direct function result. The thread is
-            non-daemon so interpreter shutdown joins it before module teardown, avoiding teardown races.
+        (callable): A wrapper function that either returns a daemon thread or the direct function result.
 
     Examples:
         >>> @threaded
@@ -1191,9 +1186,7 @@ def threaded(func):
     def wrapper(*args, **kwargs):
         """Multi-thread a given function based on 'threaded' kwarg and return the thread or function result."""
         if kwargs.pop("threaded", True):  # run in thread
-            # Non-daemon so interpreter shutdown joins the thread before module teardown; a daemon thread still
-            # running at exit can be killed mid-C-call, aborting the process (e.g. 'FATAL: exception not rethrown').
-            thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=False)
+            thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
             thread.start()
             return thread
         else:
@@ -1389,7 +1382,7 @@ class SettingsManager(JSONDict):
         /new/runs/dir
     """
 
-    def __init__(self, file=SETTINGS_FILE, version="0.0.8"):
+    def __init__(self, file=SETTINGS_FILE, version="0.0.6"):
         """Initialize the SettingsManager with default settings and load user settings."""
         import hashlib
         import uuid
@@ -1413,7 +1406,9 @@ class SettingsManager(JSONDict):
             "clearml": True,  # ClearML integration
             "comet": True,  # Comet integration
             "dvc": True,  # DVC integration
+            "hub": True,  # Ultralytics HUB integration
             "mlflow": True,  # MLflow integration
+            "neptune": True,  # Neptune integration
             "raytune": True,  # Ray Tune integration
             "tensorboard": False,  # TensorBoard logging
             "wandb": False,  # Weights & Biases logging
@@ -1424,7 +1419,7 @@ class SettingsManager(JSONDict):
         self.help_msg = (
             f"\nView Ultralytics Settings with 'yolo settings' or at '{self.file}'"
             "\nUpdate Settings with 'yolo settings key=value', i.e. 'yolo settings runs_dir=path/to/dir'. "
-            "For help see https://docs.ultralytics.com/quickstart#ultralytics-settings."
+            "For help see https://docs.ultralytics.com/quickstart/#ultralytics-settings."
         )
 
         with torch_distributed_zero_first(LOCAL_RANK):
@@ -1437,27 +1432,17 @@ class SettingsManager(JSONDict):
             self._validate_settings()
 
     def _validate_settings(self):
-        """Validate settings and migrate valid values to the current schema."""
+        """Validate the current settings and reset if necessary."""
         correct_keys = frozenset(self.keys()) == frozenset(self.defaults.keys())
         correct_types = all(isinstance(self.get(k), type(v)) for k, v in self.defaults.items())
         correct_version = self.get("settings_version", "") == self.version
 
         if not (correct_keys and correct_types and correct_version):
             LOGGER.warning(
-                "Ultralytics settings updated to the latest schema. Existing values were preserved where possible. "
-                f"{self.help_msg}"
+                "Ultralytics settings reset to default values. This may be due to a possible problem "
+                f"with your settings or a recent ultralytics package update. {self.help_msg}"
             )
-            valid = {k: v for k, v in self.items() if k in self.defaults and isinstance(v, type(self.defaults[k]))}
-            if not re.fullmatch(r"ul_[0-9a-f]{40}", valid.get("api_key", "")):
-                if valid.get("api_key"):
-                    LOGGER.warning(
-                        f"Legacy API key removed. Get a Platform API key from {PLATFORM_URL}/settings?tab=api-keys "
-                        "and run 'yolo login API_KEY'."
-                    )
-                valid["api_key"] = ""  # discard legacy keys, which cannot authenticate with Platform
-            valid["settings_version"] = self.version
-            self.clear()
-            self.update({**self.defaults, **valid})
+            self.reset()
 
         if self.get("datasets_dir") == self.get("runs_dir"):
             LOGGER.warning(
@@ -1524,6 +1509,7 @@ def vscode_msg(ext="ultralytics.ultralytics-snippets") -> str:
 # Check first-install steps
 PREFIX = colorstr("Ultralytics: ")
 SETTINGS = SettingsManager()  # initialize settings
+PERSISTENT_CACHE = JSONDict(USER_CONFIG_DIR / "persistent_cache.json")  # initialize persistent cache
 DATASETS_DIR = Path(SETTINGS["datasets_dir"])  # global datasets directory
 WEIGHTS_DIR = Path(SETTINGS["weights_dir"])  # global weights directory
 RUNS_DIR = Path(SETTINGS["runs_dir"])  # global runs directory
@@ -1545,4 +1531,4 @@ set_sentry()
 torch.save = torch_save
 if WINDOWS:
     # Apply cv2 patches for non-ASCII and non-UTF characters in image paths
-    cv2.imread, cv2.imwrite, cv2.imshow = imread_unicode, imwrite, imshow
+    cv2.imread, cv2.imwrite, cv2.imshow = imread, imwrite, imshow

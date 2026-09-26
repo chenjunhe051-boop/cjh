@@ -1,0 +1,343 @@
+"""MoE-aware PEFT extensions for MoLoRA.
+
+Provides:
+  - PerExpertRankAllocator: heuristic rank allocation based on expert activation frequency
+  - RouterCalibration: learnable low-rank correction on frozen router logits
+  - MoLoRAMoEAwareLayer: extends MoLoRALayer with per-expert ranks + router calibration
+  - MoLoRAMoEAwareConfig: configuration dataclass
+  - build_moe_aware_layer: factory function
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+import warnings
+import torch.nn as nn
+
+from .config import MoLoRAConfig
+from .layer import MoLoRALayer
+
+
+# ---------------------------------------------------------------------------
+# Per-Expert Rank Allocator
+# ---------------------------------------------------------------------------
+
+
+class PerExpertRankAllocator:
+    """Allocate per-expert LoRA rank budget based on activation frequency.
+
+    Modes:
+      - "uniform": divide budget equally among experts.
+      - "frequency": allocate proportionally to historical usage frequency,
+        with a minimum rank floor to prevent degenerate experts.
+
+    The allocation is stateless: ``allocate()`` is called with fresh usage
+    histograms every time (e.g. from a running average updated each batch).
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        total_budget: int,
+        min_rank: int = 2,
+        mode: str = "frequency",
+    ):
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be >= 1, got {num_experts}")
+        if total_budget < num_experts * min_rank:
+            raise ValueError(
+                f"total_budget ({total_budget}) must be >= num_experts * min_rank ({num_experts * min_rank})"
+            )
+        if mode not in ("uniform", "frequency"):
+            raise ValueError(f"mode must be 'uniform' or 'frequency', got '{mode}'")
+
+        self.num_experts = num_experts
+        self.total_budget = total_budget
+        self.min_rank = min_rank
+        self.mode = mode
+
+    def allocate(self, usage_history: torch.Tensor) -> List[int]:
+        """Compute per-expert rank list from a usage histogram.
+
+        Args:
+            usage_history: [num_experts] normalized frequency (sum ≈ 1.0).
+                           If empty / all-zero, falls back to uniform.
+
+        Returns:
+            List[int] of length num_experts, sum == total_budget.
+        """
+        usage = usage_history.float().cpu()
+        if usage.numel() != self.num_experts:
+            raise ValueError(f"usage_history size ({usage.numel()}) != num_experts ({self.num_experts})")
+
+        if self.mode == "uniform":
+            base = self.total_budget // self.num_experts
+            remainder = self.total_budget - base * self.num_experts
+            ranks = [base] * self.num_experts
+            # Distribute remainder to first experts
+            for i in range(remainder):
+                ranks[i] += 1
+            return ranks
+
+        # frequency mode
+        # Step 1: allocate min_rank to everyone
+        ranks = [self.min_rank] * self.num_experts
+        remaining = self.total_budget - self.num_experts * self.min_rank
+
+        # Guard against zero / negative usage
+        usage = usage.clamp_min(0.0)
+        usage_sum = usage.sum().item()
+        if usage_sum < 1e-8:
+            usage = torch.ones(self.num_experts) / self.num_experts
+            usage_sum = 1.0
+
+        # Step 2: distribute remaining budget proportionally
+        props = (usage / usage_sum).tolist()
+        # Integer allocation via largest-remainder method
+        frac_ranks = [remaining * p for p in props]
+        int_parts = [int(math.floor(v)) for v in frac_ranks]
+        remainders = [v - int_parts[i] for i, v in enumerate(frac_ranks)]
+
+        for i in range(self.num_experts):
+            ranks[i] += int_parts[i]
+
+        # Distribute leftover budget by largest remainder
+        leftover = remaining - sum(int_parts)
+        if leftover > 0:
+            sorted_idx = sorted(range(self.num_experts), key=lambda j: remainders[j], reverse=True)
+            for i in range(leftover):
+                ranks[sorted_idx[i]] += 1
+
+        # Sanity check
+        if sum(ranks) != self.total_budget:
+            raise RuntimeError(f"Rank sum {sum(ranks)} != budget {self.total_budget}")
+        return ranks
+
+
+# ---------------------------------------------------------------------------
+# Router Calibration ΔW_r
+# ---------------------------------------------------------------------------
+
+
+class RouterCalibration(nn.Module):
+    """Low-rank calibration term applied to frozen router logits.
+
+    Given input x and router_logits from a frozen pretrained router:
+        calibrated_logits = router_logits + B_r @ A_r(x)
+
+    where:
+        A_r: Linear/Conv (in_channels -> r_r)
+        B_r: Linear (r_r -> num_experts)
+
+    B_r is initialized to zero so training starts from the frozen router
+    distribution (no disruption at step 0).
+    """
+
+    def __init__(self, in_channels: int, num_experts: int, r_r: int = 4):
+        super().__init__()
+        if r_r < 1:
+            raise ValueError(f"r_r must be >= 1, got {r_r}")
+
+        self.in_channels = in_channels
+        self.num_experts = num_experts
+        self.r_r = r_r
+
+        # A_r: pool -> linear bottleneck
+        self.lora_A = nn.Linear(in_channels, r_r, bias=False)
+        # B_r: project to num_experts, zero-init
+        self.lora_B = nn.Linear(r_r, num_experts, bias=False)
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, H, W] for Conv2d input, or [B, C] for Linear input.
+            router_logits: [B, num_experts] from the frozen/base router.
+
+        Returns:
+            calibrated_logits: [B, num_experts]
+        """
+        # Global average pool for spatial inputs
+        if x.dim() == 4:
+            pooled = x.mean(dim=[2, 3])  # [B, C]
+        elif x.dim() == 2:
+            pooled = x
+        else:
+            raise ValueError(f"RouterCalibration expects 2D or 4D input, got {x.dim()}D")
+
+        delta = self.lora_B(self.lora_A(pooled))  # [B, E]
+        return router_logits + delta
+
+
+# ---------------------------------------------------------------------------
+# MoE-aware Config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MoLoRAMoEAwareConfig(MoLoRAConfig):
+    """Extended MoLoRA configuration with MoE-aware PEFT options.
+
+    Adds:
+      - router_calibration: whether to apply learnable ΔW_r on router logits
+      - router_calib_rank: rank r_r of the router calibration bottleneck
+      - per_expert_rank: whether to use per-expert rank allocation
+      - rank_allocator_mode: "uniform" or "frequency"
+      - rank_budget_total: total LoRA rank budget across all experts
+      - rank_min: minimum rank per expert (floor)
+    """
+
+    router_calibration: bool = False
+    router_calib_rank: int = 4
+
+    per_expert_rank: bool = False
+    rank_allocator_mode: str = "frequency"  # "uniform" | "frequency"
+    rank_budget_total: int = 32
+    rank_min: int = 2
+    allow_synthetic_usage_fallback: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.router_calib_rank < 1:
+            raise ValueError(f"router_calib_rank must be >= 1, got {self.router_calib_rank}")
+        if self.rank_allocator_mode not in ("uniform", "frequency"):
+            raise ValueError(f"rank_allocator_mode must be 'uniform' or 'frequency', got '{self.rank_allocator_mode}'")
+        if self.rank_budget_total < self.num_experts * self.rank_min:
+            raise ValueError(
+                f"rank_budget_total ({self.rank_budget_total}) must be >= "
+                f"num_experts * rank_min ({self.num_experts * self.rank_min})"
+            )
+
+
+# ---------------------------------------------------------------------------
+# MoE-aware MoLoRA Layer
+# ---------------------------------------------------------------------------
+
+
+class MoLoRAMoEAwareLayer(MoLoRALayer):
+    """Extends MoLoRALayer with per-expert rank allocation and router calibration.
+
+    New behaviour:
+      1. Per-expert ranks: each expert can have its own LoRA rank r_e, allocated
+         by a PerExpertRankAllocator from running usage statistics.
+      2. Router calibration: a learnable low-rank term ΔW_r = B_r @ A_r(x) is
+         added to the frozen router logits, allowing the routing distribution to
+         adapt to the target task without modifying the pretrained router weights.
+
+    The layer remains backward-compatible with standard MoLoRALayer when both
+    ``per_expert_rank`` and ``router_calibration`` are disabled.
+    """
+
+    def extra_repr(self) -> str:
+        base = super().extra_repr()
+        calib = f"calib={self.router_calibration is not None}"
+        per_rank = f"per_rank={self._expert_ranks is not None}"
+        return f"{base}, moe_aware=True, {calib}, {per_rank}"
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def build_moe_aware_layer(
+    base_layer: nn.Module,
+    config: Union[MoLoRAMoEAwareConfig, Dict[str, Any]],
+    usage_history: Optional[torch.Tensor] = None,
+) -> MoLoRAMoEAwareLayer:
+    """Build a MoLoRAMoEAwareLayer from config, handling optional features.
+
+    Args:
+        base_layer: Conv2d or Linear layer to wrap.
+        config: MoLoRAMoEAwareConfig or compatible dict.
+        usage_history: [num_experts] frequency histogram for rank allocation.
+                       Required when ``config.per_expert_rank=True`` and
+                       ``config.rank_allocator_mode='frequency'``.
+
+    Returns:
+        MoLoRAMoEAwareLayer instance.
+    """
+    if isinstance(config, dict):
+        cfg = MoLoRAMoEAwareConfig(
+            **{k: v for k, v in config.items() if k in MoLoRAMoEAwareConfig.__dataclass_fields__}
+        )
+    else:
+        cfg = config
+
+    # Router calibration
+    router_calib = None
+    if cfg.router_calibration:
+        if isinstance(base_layer, nn.Conv2d):
+            in_c = base_layer.in_channels
+        else:
+            in_c = base_layer.in_features
+        router_calib = RouterCalibration(
+            in_channels=in_c,
+            num_experts=cfg.num_experts,
+            r_r=cfg.router_calib_rank,
+        )
+
+    # Per-expert rank allocation
+    expert_ranks = None
+    if cfg.per_expert_rank:
+        allocator = PerExpertRankAllocator(
+            num_experts=cfg.num_experts,
+            total_budget=cfg.rank_budget_total,
+            min_rank=cfg.rank_min,
+            mode=cfg.rank_allocator_mode,
+        )
+        if usage_history is None:
+            if cfg.rank_allocator_mode == "frequency":
+                if not cfg.allow_synthetic_usage_fallback:
+                    raise ValueError(
+                        "frequency rank allocation requires measured usage_history when "
+                        "allow_synthetic_usage_fallback=False"
+                    )
+                warnings.warn(
+                    "MoE-aware frequency allocation is using synthetic expert usage; "
+                    "provide usage_history for production or disable the fallback.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                if cfg.num_experts == 4:
+                    usage_history = torch.tensor([0.5, 0.2, 0.2, 0.1])
+                else:
+                    x = torch.linspace(0, 1, cfg.num_experts)
+                    usage_history = torch.exp(-3 * x)
+                    usage_history = usage_history / usage_history.sum()
+            else:
+                usage_history = torch.ones(cfg.num_experts) / cfg.num_experts
+        expert_ranks = allocator.allocate(usage_history)
+
+    return MoLoRAMoEAwareLayer(
+        base_layer=base_layer,
+        r=cfg.r,
+        alpha=cfg.alpha,
+        num_experts=cfg.num_experts,
+        top_k=cfg.top_k,
+        router_type=cfg.router_type,
+        dropout=cfg.dropout,
+        use_rslora=getattr(cfg, "use_rslora", True),
+        balance_loss_coef=cfg.balance_loss_coef,
+        z_loss_coef=cfg.z_loss_coef,
+        diversity_loss_coef=cfg.diversity_loss_coef,
+        expert_init=cfg.expert_init,
+        share_moe_registry=cfg.share_moe_registry,
+        router_hidden_dim=getattr(cfg, "router_hidden_dim", None),
+        capacity_factor=cfg.capacity_factor,
+        expert_dropout=cfg.expert_dropout,
+        top_k_warmup=cfg.top_k_warmup,
+        warmup_steps=cfg.warmup_steps,
+        domain_experts=getattr(cfg, "domain_experts", None),
+        router_calibration=router_calib,
+        expert_ranks=expert_ranks,
+    )
