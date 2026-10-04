@@ -1,0 +1,17 @@
+path: /root/autodl-tmp/data_full
+train: splits/train.txt
+val: splits/val.txt
+channels: 3
+names:
+  0: person
+  1: boat
+  2: animal
+  3: seat
+  4: sign
+  5: bicycle
+  6: car
+  7: ball
+  8: light
+  9: garbage_can
+  10: uav
+  11: tricycle
